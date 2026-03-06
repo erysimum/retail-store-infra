@@ -1,10 +1,14 @@
 # =============================================================================
-# DEV ENVIRONMENT — Root Module
+# DEV ENVIRONMENT — Root Module (v2)
 # =============================================================================
-# Run from here: terraform init → terraform plan → terraform apply
+# Calls 3 modules:
+#   1. VPC    → network (unchanged)
+#   2. EKS    → cluster + node groups (addons removed)
+#   3. Addons → CoreDNS, kube-proxy, vpc-cni, ebs-csi, pod-identity
 #
-# This calls our VPC and EKS modules and wires their outputs together.
-# The S3 backend stores state remotely (created by bootstrap).
+# Terraform resolves order from data flow:
+#   VPC outputs vpc_id → EKS input
+#   EKS outputs cluster_name → Addons input
 # =============================================================================
 
 terraform {
@@ -17,11 +21,8 @@ terraform {
     }
   }
 
-  # --- Remote State Backend ---
-  # Uses the S3 bucket + DynamoDB table created by bootstrap.
-  # Each environment gets its own state file path (key).
   backend "s3" {
-    bucket         = "retail-store-tfstate-2142" # Your bootstrap bucket name
+    bucket         = "retail-store-tfstate-2142"
     key            = "environments/dev/terraform.tfstate"
     region         = "ap-southeast-2"
     dynamodb_table = "retail-store-terraform-locks"
@@ -42,10 +43,10 @@ provider "aws" {
 }
 
 # =============================================================================
-# MODULE CALLS — This is where modules get wired together
+# MODULE CALLS
 # =============================================================================
 
-# --- Step 1: Create the network ---
+# --- 1. Network ---
 module "vpc" {
   source = "../../modules/vpc"
 
@@ -57,8 +58,7 @@ module "vpc" {
   public_subnet_cidrs  = var.public_subnet_cidrs
 }
 
-# --- Step 2: Create EKS inside the VPC ---
-# module.vpc.vpc_id = output from VPC flows as input to EKS
+# --- 2. Kubernetes Cluster ---
 module "eks" {
   source = "../../modules/eks"
 
@@ -72,4 +72,13 @@ module "eks" {
   node_min_size       = var.node_min_size
   node_max_size       = var.node_max_size
   node_desired_size   = var.node_desired_size
+}
+
+# --- 3. EKS Addons (separate lifecycle from cluster) ---
+module "addons" {
+  source = "../../modules/addons"
+
+  cluster_name = module.eks.cluster_name
+  project_name = var.project_name
+  environment  = var.environment
 }
