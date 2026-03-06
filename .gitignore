@@ -1,0 +1,26 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+crash.*.log
+*.tfvars.local
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# DO commit: .terraform.lock.hcl (ensures consistent provider versions)
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
