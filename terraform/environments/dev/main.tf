@@ -1,14 +1,11 @@
 # =============================================================================
-# DEV ENVIRONMENT — Root Module (v2)
+# DEV ENVIRONMENT — Root Module (v3: + ArgoCD via Helm)
 # =============================================================================
-# Calls 3 modules:
-#   1. VPC    → network (unchanged)
-#   2. EKS    → cluster + node groups (addons removed)
+# Calls 4 modules:
+#   1. VPC    → network
+#   2. EKS    → cluster + node groups
 #   3. Addons → CoreDNS, kube-proxy, vpc-cni, ebs-csi, pod-identity
-#
-# Terraform resolves order from data flow:
-#   VPC outputs vpc_id → EKS input
-#   EKS outputs cluster_name → Addons input
+#   4. ArgoCD → GitOps engine via Helm
 # =============================================================================
 
 terraform {
@@ -18,6 +15,10 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"
     }
   }
 
@@ -38,6 +39,22 @@ provider "aws" {
       Project     = var.project_name
       Environment = var.environment
       ManagedBy   = "terraform"
+    }
+  }
+}
+
+# --- Helm Provider ---
+# Connects to EKS cluster to install Helm charts (ArgoCD)
+# Uses the same auth as kubectl — AWS EKS token
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
     }
   }
 }
@@ -74,11 +91,23 @@ module "eks" {
   node_desired_size   = var.node_desired_size
 }
 
-# --- 3. EKS Addons (separate lifecycle from cluster) ---
+# --- 3. EKS Addons ---
 module "addons" {
   source = "../../modules/addons"
 
   cluster_name = module.eks.cluster_name
   project_name = var.project_name
   environment  = var.environment
+}
+
+# --- 4. ArgoCD (GitOps Engine) ---
+module "argocd" {
+  source = "../../modules/argocd"
+
+  cluster_name                       = module.eks.cluster_name
+  cluster_endpoint                   = module.eks.cluster_endpoint
+  cluster_certificate_authority_data = module.eks.cluster_certificate_authority_data
+
+  # Ensure EKS + addons are fully ready before installing ArgoCD
+  eks_dependency = module.addons
 }
