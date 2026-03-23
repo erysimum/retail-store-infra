@@ -13,6 +13,16 @@ output "public_subnet_ids" {
   value       = module.vpc.public_subnets
 }
 
+output "database_subnet_ids" {
+  description = "List of database subnet IDs (where RDS/ElastiCache live)"
+  value       = module.vpc.database_subnets
+}
+
+output "database_subnet_group_name" {
+  description = "Name of the database subnet group for RDS"
+  value       = module.vpc.database_subnet_group_name
+}
+
 output "nat_gateway_ip" {
   description = "Public IP of the NAT Gateway"
   value       = module.vpc.nat_public_ips

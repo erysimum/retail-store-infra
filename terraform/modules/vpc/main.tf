@@ -26,6 +26,12 @@ module "vpc" {
   azs             = var.availability_zones
   private_subnets = var.private_subnet_cidrs
   public_subnets  = var.public_subnet_cidrs
+  database_subnets = var.database_subnet_cidrs
+
+# Creates a dedicated subnet group for RDS
+  create_database_subnet_group       = true
+  database_subnet_group_name         = "${var.project_name}-${var.environment}-db"
+  create_database_subnet_route_table = true
 
   # --- NAT Gateway ---
   # Required: pods in private subnets need internet to pull images
@@ -49,6 +55,9 @@ module "vpc" {
     "kubernetes.io/role/internal-elb"                               = "1"
     "kubernetes.io/cluster/${var.project_name}-${var.environment}"   = "shared"
     "karpenter.sh/discovery" = "${var.project_name}-${var.environment}"
+  }
+  database_subnet_tags = {
+  "Tier" = "database"
   }
 
   tags = {
