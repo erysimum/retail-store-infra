@@ -32,6 +32,10 @@ variable "public_subnet_cidrs" {
   description = "Public subnet CIDRs"
   type        = list(string)
 }
+variable "database_subnet_cidrs" {
+  description = "CIDR blocks for database subnets (one per AZ)"
+  type        = list(string)
+}
 
 variable "kubernetes_version" {
   description = "EKS Kubernetes version"
