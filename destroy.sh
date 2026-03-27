@@ -10,6 +10,7 @@
 #   - Network interfaces linger after NLB deletion
 #   - Subnets can't delete while ENIs/SGs reference them
 #   - Internet gateway can't detach while Elastic IPs are mapped
+#   - EBS volumes created by CSI driver survive cluster deletion
 #
 # This script cleans up orphaned AWS resources BEFORE running terraform destroy.
 # =============================================================================
@@ -25,7 +26,7 @@ echo "============================================"
 echo ""
 
 # --- Step 1: Get VPC ID from Terraform state ---
-echo "[1/6] Getting VPC ID from Terraform state..."
+echo "[1/8] Getting VPC ID from Terraform state..."
 VPC_ID=$(cd "$ENV_DIR" && terraform output -raw vpc_id 2>/dev/null || echo "")
 
 if [ -z "$VPC_ID" ]; then
@@ -39,7 +40,7 @@ echo "  VPC ID: $VPC_ID"
 echo ""
 
 # --- Step 2: Delete orphaned load balancers ---
-echo "[2/6] Checking for orphaned load balancers..."
+echo "[2/8] Checking for orphaned load balancers..."
 LB_ARNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
   --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
   --output text 2>/dev/null || echo "")
@@ -57,7 +58,7 @@ fi
 echo ""
 
 # --- Step 3: Delete orphaned target groups ---
-echo "[3/6] Checking for orphaned target groups..."
+echo "[3/8] Checking for orphaned target groups..."
 TG_ARNS=$(aws elbv2 describe-target-groups --region "$REGION" \
   --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
   --output text 2>/dev/null || echo "")
@@ -73,7 +74,7 @@ fi
 echo ""
 
 # --- Step 4: Delete orphaned network interfaces ---
-echo "[4/6] Checking for orphaned network interfaces..."
+echo "[4/8] Checking for orphaned network interfaces..."
 ENI_IDS=$(aws ec2 describe-network-interfaces --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" \
@@ -90,7 +91,7 @@ fi
 echo ""
 
 # --- Step 5: Delete orphaned security groups (non-default) ---
-echo "[5/6] Checking for orphaned security groups..."
+echo "[5/8] Checking for orphaned security groups..."
 SG_IDS=$(aws ec2 describe-security-groups --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query "SecurityGroups[?GroupName!='default'].GroupId" \
@@ -106,14 +107,37 @@ else
 fi
 echo ""
 
-# --- Step 6: Terraform destroy ---
-echo "[6/6] Running terraform destroy..."
+# --- Step 6: Delete orphaned EBS volumes created by Kubernetes CSI driver ---
+# WHY: During terraform destroy, EKS kills the CSI controller pod BEFORE
+# PVC deletion is processed. The CSI driver can't delete EBS volumes if it's
+# already dead. Result: orphaned EBS volumes costing money.
+# HOW: CSI driver tags every volume with kubernetes.io/created-for/pvc/namespace.
+# We filter for "available" (detached) + that tag = only K8s-created volumes.
+echo "[6/8] Checking for orphaned EBS volumes..."
+EBS_IDS=$(aws ec2 describe-volumes --region "$REGION" \
+  --filters "Name=status,Values=available" \
+            "Name=tag-key,Values=kubernetes.io/created-for/pvc/namespace" \
+  --query "Volumes[].VolumeId" \
+  --output text 2>/dev/null || echo "")
+
+if [ -n "$EBS_IDS" ] && [ "$EBS_IDS" != "None" ]; then
+  for VOL in $EBS_IDS; do
+    echo "  Deleting EBS volume: $VOL"
+    aws ec2 delete-volume --volume-id "$VOL" --region "$REGION"
+  done
+else
+  echo "  No orphaned EBS volumes found."
+fi
+echo ""
+
+# --- Step 7: Terraform destroy ---
+echo "[7/8] Running terraform destroy..."
 echo ""
 cd "$ENV_DIR" && terraform destroy -auto-approve
 
 echo ""
 echo "============================================"
-echo "  VERIFYING CLEANUP"
+echo "  [8/8] VERIFYING CLEANUP"
 echo "============================================"
 echo ""
 
@@ -138,6 +162,13 @@ aws ec2 describe-nat-gateways --region "$REGION" \
 echo ""
 echo "Elastic IPs:"
 aws ec2 describe-addresses --region "$REGION" --output table 2>/dev/null || echo "  None"
+
+echo ""
+echo "EBS Volumes (should be empty or only non-k8s):"
+aws ec2 describe-volumes --region "$REGION" \
+  --filters "Name=status,Values=available" \
+  --query 'Volumes[*].[VolumeId,Size,State,Tags[?Key==`kubernetes.io/created-for/pvc/namespace`].Value|[0]]' \
+  --output table 2>/dev/null || echo "  None"
 
 echo ""
 echo "============================================"
