@@ -27,3 +27,7 @@ output "argocd_password" {
   description = "Get ArgoCD admin password"
   value       = module.argocd.get_password_command
 }
+
+output "ecr_repository_urls" {
+  value = module.ecr.repository_urls
+}
