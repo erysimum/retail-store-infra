@@ -143,3 +143,12 @@ module "ingress" {
   # Must wait for EKS + addons to be fully ready
   eks_dependency = module.addons
 }
+
+# --- 6. ECR (Container Image Registry) ---
+module "ecr" {
+  source = "../../modules/ecr"
+
+  project_name     = var.project_name
+  environment      = var.environment
+  repository_names = ["catalog"]
+}

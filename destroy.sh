@@ -11,8 +11,13 @@
 #   - Subnets can't delete while ENIs/SGs reference them
 #   - Internet gateway can't detach while Elastic IPs are mapped
 #   - EBS volumes created by CSI driver survive cluster deletion
+#   - Helm releases (NGINX) timeout during destroy
+#   - Security groups created AFTER cleanup but BEFORE VPC deletion
 #
-# This script cleans up orphaned AWS resources BEFORE running terraform destroy.
+# Improvements over v1:
+#   - Pre-cleans K8s resources (NLB Services, ArgoCD apps, PVCs) BEFORE destroy
+#   - Revokes SG rules before deleting SGs (handles cross-references)
+#   - Auto-retries cleanup + destroy if first attempt fails
 # =============================================================================
 
 set -e
@@ -26,7 +31,7 @@ echo "============================================"
 echo ""
 
 # --- Step 1: Get VPC ID from Terraform state ---
-echo "[1/8] Getting VPC ID from Terraform state..."
+echo "[1/10] Getting VPC ID from Terraform state..."
 VPC_ID=$(cd "$ENV_DIR" && terraform output -raw vpc_id 2>/dev/null || echo "")
 
 if [ -z "$VPC_ID" ]; then
@@ -39,8 +44,42 @@ fi
 echo "  VPC ID: $VPC_ID"
 echo ""
 
-# --- Step 2: Delete orphaned load balancers ---
-echo "[2/8] Checking for orphaned load balancers..."
+# --- Step 2: Pre-clean Kubernetes resources ---
+# WHY: Deleting LoadBalancer Services BEFORE terraform destroy prevents
+# the NGINX helm release timeout. When we delete the Service first,
+# AWS LB Controller removes the NLB cleanly. Then Helm has nothing to wait for.
+# Deleting PVCs while CSI driver is alive ensures EBS volumes are properly released.
+echo "[2/10] Pre-cleaning Kubernetes resources..."
+if kubectl cluster-info &>/dev/null; then
+  echo "  Cluster is reachable. Cleaning up K8s resources..."
+
+  # Delete ArgoCD Applications first (removes all app deployments cleanly)
+  echo "  Deleting ArgoCD Applications..."
+  kubectl delete application --all -n argocd --timeout=60s 2>/dev/null || true
+
+  # Delete LoadBalancer services (triggers NLB deletion via LB Controller)
+  echo "  Deleting LoadBalancer services..."
+  kubectl delete svc -n ingress-nginx --all --timeout=60s 2>/dev/null || true
+
+  # Wait for NLB to be fully deleted by AWS
+  echo "  Waiting 90s for NLB cleanup..."
+  sleep 90
+
+  # Delete PVCs (triggers EBS volume deletion via CSI driver while it's still alive)
+  echo "  Deleting PVCs..."
+  kubectl delete pvc --all -A --timeout=60s 2>/dev/null || true
+
+  # Wait for EBS volumes to detach and delete
+  echo "  Waiting 30s for EBS volume cleanup..."
+  sleep 30
+else
+  echo "  Cluster not reachable. Skipping K8s pre-cleanup."
+  echo "  (Will clean orphaned AWS resources in later steps)"
+fi
+echo ""
+
+# --- Step 3: Delete orphaned load balancers ---
+echo "[3/10] Checking for orphaned load balancers..."
 LB_ARNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
   --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
   --output text 2>/dev/null || echo "")
@@ -57,8 +96,8 @@ else
 fi
 echo ""
 
-# --- Step 3: Delete orphaned target groups ---
-echo "[3/8] Checking for orphaned target groups..."
+# --- Step 4: Delete orphaned target groups ---
+echo "[4/10] Checking for orphaned target groups..."
 TG_ARNS=$(aws elbv2 describe-target-groups --region "$REGION" \
   --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
   --output text 2>/dev/null || echo "")
@@ -73,8 +112,8 @@ else
 fi
 echo ""
 
-# --- Step 4: Delete orphaned network interfaces ---
-echo "[4/8] Checking for orphaned network interfaces..."
+# --- Step 5: Delete orphaned network interfaces ---
+echo "[5/10] Checking for orphaned network interfaces..."
 ENI_IDS=$(aws ec2 describe-network-interfaces --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" \
@@ -90,14 +129,34 @@ else
 fi
 echo ""
 
-# --- Step 5: Delete orphaned security groups (non-default) ---
-echo "[5/8] Checking for orphaned security groups..."
+# --- Step 6: Delete orphaned security groups (first pass) ---
+# WHY two passes: SGs can reference each other (SG-A allows traffic from SG-B).
+# You can't delete SG-A until SG-B's rule referencing it is removed.
+# So we revoke all rules first, then delete.
+echo "[6/10] Checking for orphaned security groups..."
 SG_IDS=$(aws ec2 describe-security-groups --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query "SecurityGroups[?GroupName!='default'].GroupId" \
   --output text 2>/dev/null || echo "")
 
 if [ -n "$SG_IDS" ] && [ "$SG_IDS" != "None" ]; then
+  # First: revoke all ingress/egress rules that reference other SGs
+  for SG in $SG_IDS; do
+    echo "  Revoking rules for: $SG"
+    INGRESS=$(aws ec2 describe-security-groups --group-ids "$SG" --region "$REGION" \
+      --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null)
+    if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ]; then
+      aws ec2 revoke-security-group-ingress --group-id "$SG" --region "$REGION" \
+        --ip-permissions "$INGRESS" 2>/dev/null || true
+    fi
+    EGRESS=$(aws ec2 describe-security-groups --group-ids "$SG" --region "$REGION" \
+      --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null)
+    if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ]; then
+      aws ec2 revoke-security-group-egress --group-id "$SG" --region "$REGION" \
+        --ip-permissions "$EGRESS" 2>/dev/null || true
+    fi
+  done
+  # Second: delete the SGs
   for SG in $SG_IDS; do
     echo "  Deleting security group: $SG"
     aws ec2 delete-security-group --group-id "$SG" --region "$REGION" 2>/dev/null || true
@@ -107,13 +166,8 @@ else
 fi
 echo ""
 
-# --- Step 6: Delete orphaned EBS volumes created by Kubernetes CSI driver ---
-# WHY: During terraform destroy, EKS kills the CSI controller pod BEFORE
-# PVC deletion is processed. The CSI driver can't delete EBS volumes if it's
-# already dead. Result: orphaned EBS volumes costing money.
-# HOW: CSI driver tags every volume with kubernetes.io/created-for/pvc/namespace.
-# We filter for "available" (detached) + that tag = only K8s-created volumes.
-echo "[6/8] Checking for orphaned EBS volumes..."
+# --- Step 7: Delete orphaned EBS volumes ---
+echo "[7/10] Checking for orphaned EBS volumes..."
 EBS_IDS=$(aws ec2 describe-volumes --region "$REGION" \
   --filters "Name=status,Values=available" \
             "Name=tag-key,Values=kubernetes.io/created-for/pvc/namespace" \
@@ -130,14 +184,77 @@ else
 fi
 echo ""
 
-# --- Step 7: Terraform destroy ---
-echo "[7/8] Running terraform destroy..."
+# --- Step 8: Terraform destroy ---
+echo "[8/10] Running terraform destroy..."
 echo ""
+set +e
 cd "$ENV_DIR" && terraform destroy -auto-approve
+TF_EXIT=$?
+set -e
+
+# --- Step 9: If terraform failed, retry cleanup and destroy ---
+if [ $TF_EXIT -ne 0 ]; then
+  echo ""
+  echo "============================================"
+  echo "  [9/10] TERRAFORM FAILED — RETRYING"
+  echo "============================================"
+  echo ""
+  echo "  Cleaning up resources that appeared during destroy..."
+
+  # Re-check security groups (the #1 blocker for VPC deletion)
+  SG_IDS=$(aws ec2 describe-security-groups --region "$REGION" \
+    --filters "Name=vpc-id,Values=$VPC_ID" \
+    --query "SecurityGroups[?GroupName!='default'].GroupId" \
+    --output text 2>/dev/null || echo "")
+
+  if [ -n "$SG_IDS" ] && [ "$SG_IDS" != "None" ]; then
+    for SG in $SG_IDS; do
+      echo "  Revoking rules and deleting: $SG"
+      INGRESS=$(aws ec2 describe-security-groups --group-ids "$SG" --region "$REGION" \
+        --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null)
+      if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ]; then
+        aws ec2 revoke-security-group-ingress --group-id "$SG" --region "$REGION" \
+          --ip-permissions "$INGRESS" 2>/dev/null || true
+      fi
+      aws ec2 delete-security-group --group-id "$SG" --region "$REGION" 2>/dev/null || true
+    done
+  fi
+
+  # Re-check ENIs
+  ENI_IDS=$(aws ec2 describe-network-interfaces --region "$REGION" \
+    --filters "Name=vpc-id,Values=$VPC_ID" \
+    --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" \
+    --output text 2>/dev/null || echo "")
+
+  if [ -n "$ENI_IDS" ] && [ "$ENI_IDS" != "None" ]; then
+    for ENI in $ENI_IDS; do
+      echo "  Deleting network interface: $ENI"
+      aws ec2 delete-network-interface --network-interface-id "$ENI" --region "$REGION" 2>/dev/null || true
+    done
+  fi
+
+  # Re-check EBS volumes
+  EBS_IDS=$(aws ec2 describe-volumes --region "$REGION" \
+    --filters "Name=status,Values=available" \
+              "Name=tag-key,Values=kubernetes.io/created-for/pvc/namespace" \
+    --query "Volumes[].VolumeId" \
+    --output text 2>/dev/null || echo "")
+
+  if [ -n "$EBS_IDS" ] && [ "$EBS_IDS" != "None" ]; then
+    for VOL in $EBS_IDS; do
+      echo "  Deleting EBS volume: $VOL"
+      aws ec2 delete-volume --volume-id "$VOL" --region "$REGION"
+    done
+  fi
+
+  echo ""
+  echo "  Retrying terraform destroy..."
+  cd "$ENV_DIR" && terraform destroy -auto-approve
+fi
 
 echo ""
 echo "============================================"
-echo "  [8/8] VERIFYING CLEANUP"
+echo "  [10/10] VERIFYING CLEANUP"
 echo "============================================"
 echo ""
 
