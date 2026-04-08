@@ -31,3 +31,8 @@ output "argocd_password" {
 output "ecr_repository_urls" {
   value = module.ecr.repository_urls
 }
+
+output "github_actions_role_arn" {
+  value       = module.github_oidc.role_arn
+  description = "Add this as AWS_ROLE_ARN in retail-store-app GitHub Secrets"
+}
