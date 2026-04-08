@@ -152,3 +152,12 @@ module "ecr" {
   environment      = var.environment
   repository_names = ["catalog"]
 }
+
+# --- 7. GitHub OIDC (for CI/CD pipeline) ---
+module "github_oidc" {
+  source = "../../modules/github-oidc"
+
+  project_name = var.project_name
+  github_org   = "erysimum"
+  github_repo  = "retail-store-app"
+}
