@@ -150,7 +150,7 @@ module "ecr" {
 
   project_name     = var.project_name
   environment      = var.environment
-  repository_names = ["catalog"]
+  repository_names = ["catalog", "ui"]
 }
 
 # --- 7. GitHub OIDC (for CI/CD pipeline) ---
