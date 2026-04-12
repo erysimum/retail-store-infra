@@ -17,7 +17,7 @@
 #   Image Updater commits directly to the gitops repo.
 #   This keeps Git as the single source of truth (real GitOps).
 # =============================================================================
-
+data "aws_caller_identity" "current" {}
 # --- Fetch GitHub PAT from Secrets Manager ---
 data "aws_secretsmanager_secret_version" "github_pat" {
   secret_id = var.github_secret_name
@@ -97,23 +97,24 @@ resource "helm_release" "image_updater" {
     aws_eks_pod_identity_association.image_updater
   ]
 
-  values = [
-    yamlencode({
-      config = {
-        registries = [
-          {
-            name    = "ecr"
-            prefix  = "${var.aws_region}.amazonaws.com"
-            api_url = "https://${var.aws_region}.amazonaws.com"
-            default = true
-          }
-        ]
+ values = [
+  yamlencode({
+    config = {
+      log = {
+        level = "debug"
       }
-      serviceAccount = {
-        create = true
-        name   = "argocd-image-updater"
-      }
-      extraArgs = ["--log-level=debug"]
-    })
-  ]
+      registries = <<-EOT
+        - name: ECR
+          api_url: https://${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com
+          prefix: ${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com
+          ping: yes
+          default: true
+      EOT
+    }
+    serviceAccount = {
+      create = true
+      name   = "argocd-image-updater"
+    }
+  })
+]
 }
