@@ -90,6 +90,7 @@ resource "helm_release" "image_updater" {
   name       = "argocd-image-updater"
   repository = "https://argoproj.github.io/argo-helm"
   chart      = "argocd-image-updater"
+  version    = "0.9.6"
   namespace  = "argocd"
 
   depends_on = [
@@ -97,24 +98,24 @@ resource "helm_release" "image_updater" {
     aws_eks_pod_identity_association.image_updater
   ]
 
- values = [
-  yamlencode({
-    config = {
-      log = {
-        level = "debug"
+  values = [
+    yamlencode({
+      config = {
+        logLevel = "debug"
+        registries = [
+          {
+            name    = "ECR"
+            api_url = "https://${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
+            prefix  = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
+            ping    = true
+            default = true
+          }
+        ]
       }
-      registries = <<-EOT
-        - name: ECR
-          api_url: https://${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com
-          prefix: ${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com
-          ping: yes
-          default: true
-      EOT
-    }
-    serviceAccount = {
-      create = true
-      name   = "argocd-image-updater"
-    }
-  })
-]
+      serviceAccount = {
+        create = true
+        name   = "argocd-image-updater"
+      }
+    })
+  ]
 }
