@@ -161,3 +161,19 @@ module "github_oidc" {
   github_org   = "erysimum"
   github_repo  = "retail-store-app"
 }
+
+
+
+# --- 8. ArgoCD Image Updater ---
+module "argocd_image_updater" {
+  source = "../../modules/argocd-image-updater"
+
+  cluster_name    = module.eks.cluster_name
+  project_name    = var.project_name
+  aws_region      = var.aws_region
+  github_username = "erysimum"
+  gitops_repo_url = "https://github.com/erysimum/retail-store-gitops.git"
+
+  # Depends on EKS + addons + ArgoCD being ready
+  depends_on = [module.argocd]
+}
