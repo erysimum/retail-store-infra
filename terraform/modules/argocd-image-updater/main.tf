@@ -94,7 +94,7 @@ resource "helm_release" "image_updater" {
   namespace  = "argocd"
 
   depends_on = [
-    kubernetes_secret.git_credentials,
+    kubernetes_secret_v1.git_credentials,
     aws_eks_pod_identity_association.image_updater
   ]
 
