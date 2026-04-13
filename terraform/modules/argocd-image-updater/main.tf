@@ -29,7 +29,7 @@ locals {
 
 # --- Kubernetes Secret for GitHub credentials ---
 # Image Updater reads this to push commits to the gitops repo
-resource "kubernetes_secret" "git_credentials" {
+resource "kubernetes_secret_v1" "git_credentials" {
   metadata {
     name      = "argocd-image-updater-git-secret"
     namespace = "argocd"
