@@ -36,3 +36,11 @@ output "github_actions_role_arn" {
   value       = module.github_oidc.role_arn
   description = "Add this as AWS_ROLE_ARN in retail-store-app GitHub Secrets"
 }
+
+output "grafana_port_forward" {
+  value = module.observability.grafana_port_forward_command
+}
+
+output "prometheus_in_cluster_url" {
+  value = module.observability.prometheus_in_cluster_url
+}

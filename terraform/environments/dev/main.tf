@@ -177,3 +177,16 @@ module "argocd_image_updater" {
   # Depends on EKS + addons + ArgoCD being ready
   depends_on = [module.argocd]
 }
+
+
+module "observability" {
+  source = "../../modules/observability"
+
+  cluster_name = module.eks.cluster_name
+  aws_region   = var.aws_region
+
+  depends_on = [
+    module.addons,   # Needs EBS CSI for gp3 PVCs
+    module.eks,      # Needs cluster to exist
+  ]
+}

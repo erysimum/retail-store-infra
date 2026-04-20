@@ -1,0 +1,124 @@
+# kube-prometheus-stack Helm values override
+# Variables like ${retention_days} are interpolated by Terraform's templatefile()
+
+# -----------------------------------------------
+# Prometheus
+# -----------------------------------------------
+prometheus:
+  prometheusSpec:
+    # Metrics retention period
+    retention: ${retention_days}d
+
+    # Persistent storage for TSDB (time-series database)
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: ${storage_size}
+
+    # Resource limits — memory only, no CPU limit (our pattern)
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 2Gi
+
+    # CRITICAL: Discover ServiceMonitors from ALL namespaces
+    # Without these, Prometheus only finds ServiceMonitors with
+    # the Helm release label — our gitops-managed ones would be invisible
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    serviceMonitorSelector: {}
+
+    # Same for PrometheusRule (alert rule discovery)
+    ruleSelectorNilUsesHelmValues: false
+    ruleNamespaceSelector: {}
+    ruleSelector: {}
+
+    # Same for PodMonitor (pod-level metrics discovery)
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    podMonitorSelector: {}
+
+# -----------------------------------------------
+# Alertmanager
+# -----------------------------------------------
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+# -----------------------------------------------
+# Grafana
+# -----------------------------------------------
+grafana:
+  # Admin password from AWS Secrets Manager
+  adminPassword: "${grafana_password}"
+
+  # Persistent storage for dashboards and settings
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 5Gi
+
+  # ClusterIP only — access via kubectl port-forward
+  service:
+    type: ClusterIP
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  # Sidecar watches for ConfigMaps across ALL namespaces
+  # This lets us add dashboards and datasources via gitops repo
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+    datasources:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_datasource
+
+# -----------------------------------------------
+# node-exporter (DaemonSet — one per node)
+# -----------------------------------------------
+nodeExporter:
+  enabled: true
+
+# -----------------------------------------------
+# kube-state-metrics (K8s object state)
+# -----------------------------------------------
+kubeStateMetrics:
+  enabled: true
+
+# -----------------------------------------------
+# Prometheus Operator
+# -----------------------------------------------
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
