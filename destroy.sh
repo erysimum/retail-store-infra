@@ -13,11 +13,14 @@
 #   - EBS volumes created by CSI driver survive cluster deletion
 #   - Helm releases (NGINX) timeout during destroy
 #   - Security groups created AFTER cleanup but BEFORE VPC deletion
+#   - Prometheus CRDs survive Helm uninstall and block namespace deletion
+#   - PVCs stuck in Terminating if pods still mount them
 #
-# Improvements over v1:
-#   - Pre-cleans K8s resources (NLB Services, ArgoCD apps, PVCs) BEFORE destroy
-#   - Revokes SG rules before deleting SGs (handles cross-references)
-#   - Auto-retries cleanup + destroy if first attempt fails
+# Improvements over v2:
+#   - Deletes pods BEFORE PVCs (prevents Terminating stuck state)
+#   - Explicitly cleans monitoring namespace (StatefulSets, Deployments)
+#   - Cleans Prometheus Operator CRDs (survive Helm uninstall)
+#   - Cleans orphaned EBS volumes tagged by CSI driver
 # =============================================================================
 
 set -e
@@ -31,7 +34,7 @@ echo "============================================"
 echo ""
 
 # --- Step 1: Get VPC ID from Terraform state ---
-echo "[1/10] Getting VPC ID from Terraform state..."
+echo "[1/11] Getting VPC ID from Terraform state..."
 VPC_ID=$(cd "$ENV_DIR" && terraform output -raw vpc_id 2>/dev/null || echo "")
 
 if [ -z "$VPC_ID" ]; then
@@ -45,11 +48,7 @@ echo "  VPC ID: $VPC_ID"
 echo ""
 
 # --- Step 2: Pre-clean Kubernetes resources ---
-# WHY: Deleting LoadBalancer Services BEFORE terraform destroy prevents
-# the NGINX helm release timeout. When we delete the Service first,
-# AWS LB Controller removes the NLB cleanly. Then Helm has nothing to wait for.
-# Deleting PVCs while CSI driver is alive ensures EBS volumes are properly released.
-echo "[2/10] Pre-cleaning Kubernetes resources..."
+echo "[2/11] Pre-cleaning Kubernetes resources..."
 if kubectl cluster-info &>/dev/null; then
   echo "  Cluster is reachable. Cleaning up K8s resources..."
 
@@ -65,8 +64,36 @@ if kubectl cluster-info &>/dev/null; then
   echo "  Waiting 90s for NLB cleanup..."
   sleep 90
 
-  # Delete PVCs (triggers EBS volume deletion via CSI driver while it's still alive)
-  echo "  Deleting PVCs..."
+  # -------------------------------------------------------
+  # Clean monitoring namespace — ORDER MATTERS
+  # 1. Delete Prometheus/Alertmanager custom resources
+  #    (this tells the operator to tear down StatefulSets)
+  # 2. Delete all pods (releases PVC mounts)
+  # 3. Delete PVCs (triggers EBS volume deletion)
+  # -------------------------------------------------------
+  echo "  Cleaning monitoring namespace..."
+
+  # Delete Prometheus and Alertmanager custom resources
+  # The operator manages StatefulSets via these CRs — deleting the CR
+  # tells the operator to cleanly tear down the StatefulSet and pods
+  echo "    Deleting Prometheus custom resources..."
+  kubectl delete prometheus --all -n monitoring --timeout=60s 2>/dev/null || true
+  kubectl delete alertmanager --all -n monitoring --timeout=60s 2>/dev/null || true
+
+  # Delete all deployments in monitoring (Grafana, operator, kube-state-metrics)
+  echo "    Deleting monitoring deployments..."
+  kubectl delete deployment --all -n monitoring --timeout=60s 2>/dev/null || true
+
+  # Delete all daemonsets in monitoring (node-exporter)
+  echo "    Deleting monitoring daemonsets..."
+  kubectl delete daemonset --all -n monitoring --timeout=60s 2>/dev/null || true
+
+  # Wait for pods to fully terminate before touching PVCs
+  echo "    Waiting 30s for pods to terminate..."
+  sleep 30
+
+  # Now delete PVCs — pods are gone, so PVCs won't get stuck in Terminating
+  echo "  Deleting all PVCs across all namespaces..."
   kubectl delete pvc --all -A --timeout=60s 2>/dev/null || true
 
   # Wait for EBS volumes to detach and delete
@@ -79,7 +106,7 @@ fi
 echo ""
 
 # --- Step 3: Delete orphaned load balancers ---
-echo "[3/10] Checking for orphaned load balancers..."
+echo "[3/11] Checking for orphaned load balancers..."
 LB_ARNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
   --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
   --output text 2>/dev/null || echo "")
@@ -97,7 +124,7 @@ fi
 echo ""
 
 # --- Step 4: Delete orphaned target groups ---
-echo "[4/10] Checking for orphaned target groups..."
+echo "[4/11] Checking for orphaned target groups..."
 TG_ARNS=$(aws elbv2 describe-target-groups --region "$REGION" \
   --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
   --output text 2>/dev/null || echo "")
@@ -113,7 +140,7 @@ fi
 echo ""
 
 # --- Step 5: Delete orphaned network interfaces ---
-echo "[5/10] Checking for orphaned network interfaces..."
+echo "[5/11] Checking for orphaned network interfaces..."
 ENI_IDS=$(aws ec2 describe-network-interfaces --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" \
@@ -129,11 +156,8 @@ else
 fi
 echo ""
 
-# --- Step 6: Delete orphaned security groups (first pass) ---
-# WHY two passes: SGs can reference each other (SG-A allows traffic from SG-B).
-# You can't delete SG-A until SG-B's rule referencing it is removed.
-# So we revoke all rules first, then delete.
-echo "[6/10] Checking for orphaned security groups..."
+# --- Step 6: Delete orphaned security groups ---
+echo "[6/11] Checking for orphaned security groups..."
 SG_IDS=$(aws ec2 describe-security-groups --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" \
   --query "SecurityGroups[?GroupName!='default'].GroupId" \
@@ -167,7 +191,7 @@ fi
 echo ""
 
 # --- Step 7: Delete orphaned EBS volumes ---
-echo "[7/10] Checking for orphaned EBS volumes..."
+echo "[7/11] Checking for orphaned EBS volumes..."
 EBS_IDS=$(aws ec2 describe-volumes --region "$REGION" \
   --filters "Name=status,Values=available" \
             "Name=tag-key,Values=kubernetes.io/created-for/pvc/namespace" \
@@ -185,7 +209,7 @@ fi
 echo ""
 
 # --- Step 8: Terraform destroy ---
-echo "[8/10] Running terraform destroy..."
+echo "[8/11] Running terraform destroy..."
 echo ""
 set +e
 cd "$ENV_DIR" && terraform destroy -auto-approve
@@ -196,7 +220,7 @@ set -e
 if [ $TF_EXIT -ne 0 ]; then
   echo ""
   echo "============================================"
-  echo "  [9/10] TERRAFORM FAILED — RETRYING"
+  echo "  [9/11] TERRAFORM FAILED — RETRYING"
   echo "============================================"
   echo ""
   echo "  Cleaning up resources that appeared during destroy..."
@@ -252,9 +276,30 @@ if [ $TF_EXIT -ne 0 ]; then
   cd "$ENV_DIR" && terraform destroy -auto-approve
 fi
 
+# --- Step 10: Clean up Prometheus CRDs ---
+# WHY: Prometheus Operator CRDs are cluster-scoped and survive Helm uninstall.
+# They're harmless (no cost) but we clean them for a pristine state.
+echo ""
+echo "[10/11] Cleaning up Prometheus CRDs..."
+if kubectl cluster-info &>/dev/null; then
+  kubectl delete crd alertmanagerconfigs.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd alertmanagers.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd podmonitors.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd probes.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd prometheusagents.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd prometheuses.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd prometheusrules.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd scrapeconfigs.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd servicemonitors.monitoring.coreos.com 2>/dev/null || true
+  kubectl delete crd thanosrulers.monitoring.coreos.com 2>/dev/null || true
+  echo "  CRDs cleaned."
+else
+  echo "  Cluster already destroyed. CRDs removed with it."
+fi
+
 echo ""
 echo "============================================"
-echo "  [10/10] VERIFYING CLEANUP"
+echo "  [11/11] VERIFYING CLEANUP"
 echo "============================================"
 echo ""
 
