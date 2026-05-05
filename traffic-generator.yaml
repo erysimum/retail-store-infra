@@ -1,0 +1,60 @@
+# Traffic generator — simulates users browsing the retail store
+# Runs as a Deployment so it restarts if the pod dies
+# Uses in-cluster DNS to hit UI service (no NLB needed)
+#
+# What it does:
+#   - Continuously browses products (GET /catalog)
+#   - Hits the homepage (GET /)
+#   - Checks individual product pages
+#   - Occasionally adds to cart (POST)
+#   - Mix of traffic types so RED metrics look realistic
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-generator
+  namespace: ui-dev
+  labels:
+    app: traffic-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-generator
+  template:
+    metadata:
+      labels:
+        app: traffic-generator
+    spec:
+      containers:
+        - name: traffic
+          image: curlimages/curl:8.10.1
+          command:
+            - /bin/sh
+            - -c
+            - |
+              UI_URL="http://ui.ui-dev.svc.cluster.local:8080"
+              echo "Starting traffic generator against $UI_URL"
+
+              while true; do
+                # Homepage (triggers catalog list)
+                curl -s -o /dev/null -w "homepage: %{http_code} %{time_total}s\n" "$UI_URL/" || true
+
+                # Catalog page
+                curl -s -o /dev/null -w "catalog: %{http_code} %{time_total}s\n" "$UI_URL/catalog" || true
+
+                # Cart page (triggers cart service)
+                curl -s -o /dev/null -w "cart: %{http_code} %{time_total}s\n" "$UI_URL/cart" || true
+
+                # Checkout page (triggers checkout service)
+                curl -s -o /dev/null -w "checkout: %{http_code} %{time_total}s\n" "$UI_URL/checkout" || true
+
+                # Small pause so we don't melt the cluster
+                sleep 2
+              done
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
