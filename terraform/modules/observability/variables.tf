@@ -4,13 +4,13 @@ variable "cluster_name" {
 }
 
 variable "namespace" {
-  description = "Kubernetes namespace where the stack will be installed"
+  description = "Kubernetes namespace where the observability stack will be installed"
   type        = string
   default     = "monitoring"
 }
 
 variable "chart_version" {
-  description = "kube-prometheus-stack Helm chart version. Pin explicitly — do not use latest."
+  description = "kube-prometheus-stack Helm chart version — pin explicitly, never use latest"
   type        = string
   default     = "65.5.0"
 }
@@ -22,7 +22,7 @@ variable "prometheus_retention_days" {
 }
 
 variable "prometheus_storage_size" {
-  description = "PVC size for Prometheus TSDB"
+  description = "PVC size for Prometheus TSDB storage"
   type        = string
   default     = "10Gi"
 }
@@ -33,7 +33,19 @@ variable "grafana_admin_secret_name" {
   default     = "retail-store/grafana-admin"
 }
 
+variable "slack_webhook_secret_name" {
+  description = "AWS Secrets Manager secret name containing Slack webhook URL"
+  type        = string
+  default     = "retail-store/slack-webhook"
+}
+
+variable "pagerduty_key_secret_name" {
+  description = "AWS Secrets Manager secret name containing PagerDuty integration key"
+  type        = string
+  default     = "retail-store/pagerduty-key"
+}
+
 variable "aws_region" {
-  description = "AWS region (needed for Secrets Manager lookup)"
+  description = "AWS region for Secrets Manager lookup"
   type        = string
 }

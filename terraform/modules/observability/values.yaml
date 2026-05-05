@@ -6,10 +6,8 @@
 # -----------------------------------------------
 prometheus:
   prometheusSpec:
-    # Metrics retention period
     retention: ${retention_days}d
 
-    # Persistent storage for TSDB (time-series database)
     storageSpec:
       volumeClaimTemplate:
         spec:
@@ -19,7 +17,6 @@ prometheus:
             requests:
               storage: ${storage_size}
 
-    # Resource limits — memory only, no CPU limit (our pattern)
     resources:
       requests:
         cpu: 200m
@@ -27,25 +24,22 @@ prometheus:
       limits:
         memory: 2Gi
 
-    # CRITICAL: Discover ServiceMonitors from ALL namespaces
-    # Without these, Prometheus only finds ServiceMonitors with
-    # the Helm release label — our gitops-managed ones would be invisible
+    # Discover ServiceMonitors from ALL namespaces
     serviceMonitorSelectorNilUsesHelmValues: false
     serviceMonitorNamespaceSelector: {}
     serviceMonitorSelector: {}
 
-    # Same for PrometheusRule (alert rule discovery)
+    # Discover PrometheusRules from ALL namespaces
     ruleSelectorNilUsesHelmValues: false
     ruleNamespaceSelector: {}
     ruleSelector: {}
 
-    # Same for PodMonitor (pod-level metrics discovery)
     podMonitorSelectorNilUsesHelmValues: false
     podMonitorNamespaceSelector: {}
     podMonitorSelector: {}
 
 # -----------------------------------------------
-# Alertmanager
+# Alertmanager — full routing config
 # -----------------------------------------------
 alertmanager:
   alertmanagerSpec:
@@ -64,20 +58,128 @@ alertmanager:
       limits:
         memory: 256Mi
 
+  # Alertmanager routing configuration
+  # Defines: where alerts go based on severity labels
+  config:
+    global:
+      resolve_timeout: 5m
+      slack_api_url: "${slack_webhook_url}"
+
+    # Routing tree — first match wins
+    route:
+      # Default catch-all goes to Slack
+      receiver: 'slack-default'
+      # Group alerts to avoid spam
+      group_by: ['alertname', 'service', 'severity']
+      group_wait: 30s          # Wait 30s after first alert before sending
+      group_interval: 5m       # Wait 5m before sending updates to same group
+      repeat_interval: 12h     # Resend unresolved alerts every 12h
+
+      routes:
+        
+        - # Watchdog alert (Prometheus heartbeat) → null receiver
+        # This alert fires constantly to confirm Alertmanager works
+        - matchers:
+            - alertname = "Watchdog"
+          receiver: 'null'
+          # Critical alerts → PagerDuty (phone call) AND Slack
+        - matchers:
+            - severity = "critical"
+          receiver: 'pagerduty'
+          continue: true       # Also fall through to next route (Slack)
+        - matchers:
+            - severity = "critical"
+          receiver: 'slack-critical'
+
+        # Warning alerts → Slack only
+        - matchers:
+            - severity = "warning"
+          receiver: 'slack-warnings'
+
+       
+
+    # Inhibition: if a critical alert is firing, suppress
+    # related warning alerts to avoid duplicate noise
+    inhibit_rules:
+      - source_matchers:
+          - severity = "critical"
+        target_matchers:
+          - severity = "warning"
+        equal: ['alertname', 'service']
+
+    # Alert receivers (the destinations)
+    receivers:
+      # Black hole for Watchdog
+      - name: 'null'
+
+      # Default Slack — for anything not caught by specific routes
+      - name: 'slack-default'
+        slack_configs:
+          - channel: '#alerts'
+            send_resolved: true
+            title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              *Alert:* {{ .Annotations.summary }}{{ if .Labels.severity }} - `{{ .Labels.severity }}`{{ end }}
+              *Description:* {{ .Annotations.description }}
+              *Service:* {{ .Labels.service }}
+              *Runbook:* {{ .Annotations.runbook_url }}
+              {{ end }}
+
+      # Critical alerts to Slack (also goes to PagerDuty in parallel)
+      - name: 'slack-critical'
+        slack_configs:
+          - channel: '#alerts'
+            send_resolved: true
+            color: 'danger'
+            title: '🚨 [CRITICAL] {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              *PAGING ON-CALL ENGINEER*
+              *Alert:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              *Service:* {{ .Labels.service }}
+              *Runbook:* {{ .Annotations.runbook_url }}
+              {{ end }}
+
+      # Warning alerts to Slack
+      - name: 'slack-warnings'
+        slack_configs:
+          - channel: '#alerts'
+            send_resolved: true
+            color: 'warning'
+            title: '⚠️ [WARNING] {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              *Alert:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              *Service:* {{ .Labels.service }}
+              *Runbook:* {{ .Annotations.runbook_url }}
+              {{ end }}
+
+      # PagerDuty for critical alerts (phone call)
+      - name: 'pagerduty'
+        pagerduty_configs:
+          - service_key: "${pagerduty_integration_key}"
+            description: '{{ .CommonAnnotations.summary }}'
+            details:
+              alertname: '{{ .CommonLabels.alertname }}'
+              service: '{{ .CommonLabels.service }}'
+              severity: '{{ .CommonLabels.severity }}'
+              description: '{{ .CommonAnnotations.description }}'
+              runbook: '{{ .CommonAnnotations.runbook_url }}'
+
 # -----------------------------------------------
 # Grafana
 # -----------------------------------------------
 grafana:
-  # Admin password from AWS Secrets Manager
   adminPassword: "${grafana_password}"
 
-  # Persistent storage for dashboards and settings
   persistence:
     enabled: true
     storageClassName: gp3
     size: 5Gi
 
-  # ClusterIP only — access via kubectl port-forward
   service:
     type: ClusterIP
 
@@ -88,8 +190,6 @@ grafana:
     limits:
       memory: 512Mi
 
-  # Sidecar watches for ConfigMaps across ALL namespaces
-  # This lets us add dashboards and datasources via gitops repo
   sidecar:
     dashboards:
       enabled: true
@@ -101,13 +201,13 @@ grafana:
       label: grafana_datasource
 
 # -----------------------------------------------
-# node-exporter (DaemonSet — one per node)
+# node-exporter
 # -----------------------------------------------
 nodeExporter:
   enabled: true
 
 # -----------------------------------------------
-# kube-state-metrics (K8s object state)
+# kube-state-metrics
 # -----------------------------------------------
 kubeStateMetrics:
   enabled: true

@@ -6,27 +6,41 @@
 # -----------------------------------------------------
 
 # Fetch Grafana admin password from AWS Secrets Manager
-# Same pattern used for GitHub PAT in argocd-image-updater module
 data "aws_secretsmanager_secret_version" "grafana_admin" {
   secret_id = var.grafana_admin_secret_name
+}
+
+# Fetch Slack webhook URL for Alertmanager
+data "aws_secretsmanager_secret_version" "slack_webhook" {
+  secret_id = var.slack_webhook_secret_name
+}
+
+# Fetch PagerDuty integration key for Alertmanager
+data "aws_secretsmanager_secret_version" "pagerduty_key" {
+  secret_id = var.pagerduty_key_secret_name
 }
 
 locals {
   grafana_admin_password = jsondecode(
     data.aws_secretsmanager_secret_version.grafana_admin.secret_string
   )["password"]
+
+  slack_webhook_url = jsondecode(
+    data.aws_secretsmanager_secret_version.slack_webhook.secret_string
+  )["url"]
+
+  pagerduty_integration_key = jsondecode(
+    data.aws_secretsmanager_secret_version.pagerduty_key.secret_string
+  )["key"]
 }
 
 # Create monitoring namespace explicitly
-# (not via Helm createNamespace — we control labels and lifecycle)
 resource "kubernetes_namespace_v1" "monitoring" {
   metadata {
     name = var.namespace
     labels = {
-      "app.kubernetes.io/managed-by"       = "terraform"
+      "app.kubernetes.io/managed-by"        = "terraform"
       "pod-security.kubernetes.io/enforce"  = "privileged"
-      # node-exporter needs host network + privileged access
-      # to read /proc and /sys for node-level metrics
     }
   }
 }
@@ -39,22 +53,18 @@ resource "helm_release" "kube_prometheus_stack" {
   version    = var.chart_version
   namespace  = kubernetes_namespace_v1.monitoring.metadata[0].name
 
-  # Render values.yaml with variables interpolated
   values = [
     templatefile("${path.module}/values.yaml", {
-      retention_days   = var.prometheus_retention_days
-      storage_size     = var.prometheus_storage_size
-      grafana_password = local.grafana_admin_password
+      retention_days            = var.prometheus_retention_days
+      storage_size              = var.prometheus_storage_size
+      grafana_password          = local.grafana_admin_password
+      slack_webhook_url         = local.slack_webhook_url
+      pagerduty_integration_key = local.pagerduty_integration_key
     })
   ]
 
-  # Chart is large — allow 10 minutes for all pods to come up
-  timeout = 600
-
-  # Block until all resources are ready
-  wait = true
-
-  # Don't create namespace — we already created it above
+  timeout          = 600
+  wait             = true
   create_namespace = false
 
   depends_on = [
