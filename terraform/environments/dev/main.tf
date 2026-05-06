@@ -190,3 +190,16 @@ module "observability" {
     module.eks,      # Needs cluster to exist
   ]
 }
+
+
+
+module "pyrra" {
+  source = "../../modules/pyrra"
+
+  namespace      = module.observability.namespace
+  prometheus_url = module.observability.prometheus_in_cluster_url
+
+  depends_on = [
+    module.observability,  # Needs Prometheus to exist first
+  ]
+}
