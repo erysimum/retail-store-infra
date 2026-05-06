@@ -1,0 +1,34 @@
+# Pyrra Helm values
+
+# Pyrra has two components:
+# 1. API Server — web UI showing SLO status, error budget, burn rate
+# 2. Kubernetes Operator — watches for ServiceLevelObjective CRDs and
+#    generates PrometheusRules
+
+# API Server configuration (the UI)
+apiserver:
+  enabled: true
+  prometheusUrl: "${prometheus_url}"
+  service:
+    type: ClusterIP
+    port: 9099
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# Kubernetes Operator (watches for SLO CRDs)
+kubernetesOperator:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# How often to reconcile SLOs into PrometheusRules
+# (faster reconciliation = SLO changes apply quicker)
+configMapReloadInterval: 30s
