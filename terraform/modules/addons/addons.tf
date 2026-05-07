@@ -76,6 +76,47 @@ resource "aws_eks_addon" "ebs_csi" {
   }
 }
 
+
+resource "helm_release" "metrics_server" {
+  name       = "metrics-server"
+  repository = "https://kubernetes-sigs.github.io/metrics-server/"
+  chart      = "metrics-server"
+  version    = "3.12.2"
+  namespace  = "kube-system"
+
+  values = [
+    yamlencode({
+      args = [
+        # Required for EKS — kubelet uses self-signed certs
+        "--kubelet-insecure-tls",
+        "--kubelet-preferred-address-types=InternalIP"
+      ]
+      resources = {
+        requests = {
+          cpu    = "50m"
+          memory = "100Mi"
+        }
+        limits = {
+          memory = "200Mi"
+        }
+      }
+    })
+  ]
+
+  timeout = 300
+  wait    = true
+
+  depends_on = [
+    aws_eks_addon.coredns,
+  ]
+}
+
+
+
+
+
+
+
 # --- Remove gp2 as default StorageClass (we use gp3 instead) ---
 resource "kubernetes_annotations" "remove_gp2_default" {
   api_version = "storage.k8s.io/v1"
