@@ -76,17 +76,17 @@ alertmanager:
       repeat_interval: 12h     # Resend unresolved alerts every 12h
 
       routes:
-        
-        - # Watchdog alert (Prometheus heartbeat) → null receiver
-        # This alert fires constantly to confirm Alertmanager works
+        # Watchdog alert (Prometheus heartbeat) → null receiver
         - matchers:
             - alertname = "Watchdog"
           receiver: 'null'
-          # Critical alerts → PagerDuty (phone call) AND Slack
+
+        # Critical alerts → PagerDuty AND Slack (continue: true falls through)
         - matchers:
             - severity = "critical"
           receiver: 'pagerduty'
-          continue: true       # Also fall through to next route (Slack)
+          continue: true
+
         - matchers:
             - severity = "critical"
           receiver: 'slack-critical'
@@ -95,7 +95,6 @@ alertmanager:
         - matchers:
             - severity = "warning"
           receiver: 'slack-warnings'
-
        
 
     # Inhibition: if a critical alert is firing, suppress
