@@ -13,7 +13,7 @@
 
 resource "helm_release" "pyrra" {
   name       = "pyrra"
-  repository = "https://pyrra-dev.github.io/pyrra"
+  repository = "https://pyrra-dev.github.io/helm-charts"
   chart      = "pyrra"
   version    = var.chart_version
   namespace  = var.namespace
