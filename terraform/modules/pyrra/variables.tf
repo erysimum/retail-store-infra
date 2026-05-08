@@ -7,7 +7,7 @@ variable "namespace" {
 variable "chart_version" {
   description = "Pyrra Helm chart version - pin explicitly"
   type        = string
-  default     = "0.7.4"
+  default     = "1.5.0"
 }
 
 variable "prometheus_url" {
