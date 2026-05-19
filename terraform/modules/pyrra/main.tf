@@ -25,7 +25,8 @@ resource "helm_release" "pyrra" {
     })
   ]
 
-  timeout          = 300
+  timeout          = 900
   wait             = true
+  disable_webhooks  = true
   create_namespace = false  # monitoring namespace already exists
 }

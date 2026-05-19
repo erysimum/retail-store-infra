@@ -16,8 +16,9 @@ resource "helm_release" "argocd" {
   version          = var.argocd_chart_version
 
   # Wait for all pods to be ready before marking as complete
-  wait    = true
-  timeout = 600 # 10 minutes max
+  timeout          = 900
+  wait             = true
+  disable_webhooks  = true
 
   # --- ArgoCD Configuration ---
   # server.service.type = NodePort (access via port-forward)

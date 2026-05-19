@@ -103,8 +103,9 @@ resource "helm_release" "metrics_server" {
     })
   ]
 
-  timeout = 300
-  wait    = true
+  timeout          = 900
+  wait             = true
+  disable_webhooks  = true
 
   depends_on = [
     aws_eks_addon.coredns,
