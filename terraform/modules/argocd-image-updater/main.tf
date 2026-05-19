@@ -93,6 +93,10 @@ resource "helm_release" "image_updater" {
   version    = "0.9.6"
   namespace  = "argocd"
 
+  timeout          = 900
+  wait             = true
+  disable_webhooks  = true
+
   depends_on = [
     kubernetes_secret_v1.git_credentials,
     aws_eks_pod_identity_association.image_updater

@@ -10,8 +10,9 @@ resource "helm_release" "aws_lb_controller" {
   namespace  = "kube-system"
   version    = var.aws_lb_controller_chart_version
 
-  wait    = true
-  timeout = 300
+  timeout          = 900
+  wait             = true
+  disable_webhooks  = true
 
   set {
     name  = "clusterName"

@@ -63,8 +63,9 @@ resource "helm_release" "kube_prometheus_stack" {
     })
   ]
 
-  timeout          = 600
+  timeout          = 900
   wait             = true
+  disable_webhooks  = true
   create_namespace = false
 
   depends_on = [
