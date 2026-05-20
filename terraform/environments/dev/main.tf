@@ -23,7 +23,7 @@ terraform {
     kubernetes = {
       source  = "hashicorp/kubernetes"
       version = "~> 3.0"
-}
+    }
   }
 
   backend "s3" {
@@ -84,12 +84,12 @@ provider "kubernetes" {
 module "vpc" {
   source = "../../modules/vpc"
 
-  project_name         = var.project_name
-  environment          = var.environment
-  vpc_cidr             = var.vpc_cidr
-  availability_zones   = var.availability_zones
-  private_subnet_cidrs = var.private_subnet_cidrs
-  public_subnet_cidrs  = var.public_subnet_cidrs
+  project_name          = var.project_name
+  environment           = var.environment
+  vpc_cidr              = var.vpc_cidr
+  availability_zones    = var.availability_zones
+  private_subnet_cidrs  = var.private_subnet_cidrs
+  public_subnet_cidrs   = var.public_subnet_cidrs
   database_subnet_cidrs = var.database_subnet_cidrs
 }
 
@@ -186,8 +186,8 @@ module "observability" {
   aws_region   = var.aws_region
 
   depends_on = [
-    module.addons,   # Needs EBS CSI for gp3 PVCs
-    module.eks,      # Needs cluster to exist
+    module.addons, # Needs EBS CSI for gp3 PVCs
+    module.eks,    # Needs cluster to exist
   ]
 }
 
@@ -200,6 +200,23 @@ module "pyrra" {
   prometheus_url = module.observability.prometheus_in_cluster_url
 
   depends_on = [
-    module.observability,  # Needs Prometheus to exist first
+    module.observability, # Needs Prometheus to exist first
+  ]
+}
+
+
+## Istio service mesh
+# Installs control plane only. Sidecar injection is enabled per-namespace
+# in the platform layer (NetworkPolicy + injection labels).
+module "istio" {
+  source = "../../modules/istio"
+
+  chart_version   = "1.29.2"
+  namespace       = "istio-system"
+  istiod_replicas = 1
+
+  depends_on = [
+    module.eks,
+    module.addons, # need EBS CSI, CoreDNS up first
   ]
 }
