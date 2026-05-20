@@ -1,6 +1,18 @@
 # kube-prometheus-stack Helm values override
 # Variables like ${retention_days} are interpolated by Terraform's templatefile()
 
+
+#AWS EKS hides the controller-manager, scheduler, kube-proxy, and etcd
+# behind the managed API endpoint. They cannot be scraped from the worker
+# nodes, so the corresponding "down" alerts would always fire as false
+# positives. Disabling these rules at the chart level is the permanent fix.
+defaultRules:
+  rules:
+    kubeControllerManager: false
+    kubeScheduler: false
+    kubeProxy: false
+    etcd: false
+
 # -----------------------------------------------
 # Prometheus
 # -----------------------------------------------
