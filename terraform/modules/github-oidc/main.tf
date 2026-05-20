@@ -31,7 +31,7 @@ resource "aws_iam_openid_connect_provider" "github" {
 # --- IAM Role for GitHub Actions ---
 resource "aws_iam_role" "github_actions" {
   name = "${var.project_name}-github-actions"
-# Trust policy: ONLY this specific repo can assume this role
+  # Trust policy: ONLY this specific repo can assume this role
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
