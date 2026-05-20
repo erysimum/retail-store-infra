@@ -12,6 +12,12 @@ override.tf.json
 .terraformrc
 terraform.rc
 
+# Terraform plan files (binary, contain sensitive data from data sources)
+*.tfplan
+tfplan
+tfplan.*
+*.plan
+
 # DO commit: .terraform.lock.hcl (ensures consistent provider versions)
 
 # IDE
