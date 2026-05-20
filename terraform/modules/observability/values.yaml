@@ -171,7 +171,7 @@ alertmanager:
       # PagerDuty for critical alerts (phone call)
       - name: 'pagerduty'
         pagerduty_configs:
-          - service_key: "${pagerduty_integration_key}"
+          - routing_key: "${pagerduty_integration_key}"
             description: '{{ .CommonAnnotations.summary }}'
             details:
               alertname: '{{ .CommonLabels.alertname }}'
