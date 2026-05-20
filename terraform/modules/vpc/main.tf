@@ -23,12 +23,12 @@ module "vpc" {
   name = "${var.project_name}-${var.environment}"
   cidr = var.vpc_cidr
 
-  azs             = var.availability_zones
-  private_subnets = var.private_subnet_cidrs
-  public_subnets  = var.public_subnet_cidrs
+  azs              = var.availability_zones
+  private_subnets  = var.private_subnet_cidrs
+  public_subnets   = var.public_subnet_cidrs
   database_subnets = var.database_subnet_cidrs
 
-# Creates a dedicated subnet group for RDS
+  # Creates a dedicated subnet group for RDS
   create_database_subnet_group       = true
   database_subnet_group_name         = "${var.project_name}-${var.environment}-db"
   create_database_subnet_route_table = true
@@ -47,17 +47,17 @@ module "vpc" {
   # --- Tags required by EKS for subnet auto-discovery ---
   # Without these tags, EKS can't find where to place load balancers/nodes
   public_subnet_tags = {
-    "kubernetes.io/role/elb"                                        = "1"
-    "kubernetes.io/cluster/${var.project_name}-${var.environment}"   = "shared"
+    "kubernetes.io/role/elb"                                       = "1"
+    "kubernetes.io/cluster/${var.project_name}-${var.environment}" = "shared"
   }
 
   private_subnet_tags = {
-    "kubernetes.io/role/internal-elb"                               = "1"
-    "kubernetes.io/cluster/${var.project_name}-${var.environment}"   = "shared"
-    "karpenter.sh/discovery" = "${var.project_name}-${var.environment}"
+    "kubernetes.io/role/internal-elb"                              = "1"
+    "kubernetes.io/cluster/${var.project_name}-${var.environment}" = "shared"
+    "karpenter.sh/discovery"                                       = "${var.project_name}-${var.environment}"
   }
   database_subnet_tags = {
-  "Tier" = "database"
+    "Tier" = "database"
   }
 
   tags = {

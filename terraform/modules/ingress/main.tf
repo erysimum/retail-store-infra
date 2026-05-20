@@ -12,7 +12,7 @@ resource "helm_release" "aws_lb_controller" {
 
   timeout          = 900
   wait             = true
-  disable_webhooks  = true
+  disable_webhooks = true
 
   set {
     name  = "clusterName"

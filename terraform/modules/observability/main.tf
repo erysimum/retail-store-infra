@@ -39,8 +39,8 @@ resource "kubernetes_namespace_v1" "monitoring" {
   metadata {
     name = var.namespace
     labels = {
-      "app.kubernetes.io/managed-by"        = "terraform"
-      "pod-security.kubernetes.io/enforce"  = "privileged"
+      "app.kubernetes.io/managed-by"       = "terraform"
+      "pod-security.kubernetes.io/enforce" = "privileged"
     }
   }
 }
@@ -65,7 +65,7 @@ resource "helm_release" "kube_prometheus_stack" {
 
   timeout          = 900
   wait             = true
-  disable_webhooks  = true
+  disable_webhooks = true
   create_namespace = false
 
   depends_on = [

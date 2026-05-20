@@ -95,7 +95,7 @@ resource "helm_release" "image_updater" {
 
   timeout          = 900
   wait             = true
-  disable_webhooks  = true
+  disable_webhooks = true
 
   depends_on = [
     kubernetes_secret_v1.git_credentials,
