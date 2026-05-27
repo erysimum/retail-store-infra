@@ -19,7 +19,7 @@ database_subnet_cidrs = ["10.0.201.0/24", "10.0.202.0/24"]
 
 # --- EKS ---
 kubernetes_version  = "1.31"
-node_instance_types = ["t3.medium"]
+node_instance_types = ["t3.large"]
 node_min_size       = 1
 node_max_size       = 3
 node_desired_size   = 3
