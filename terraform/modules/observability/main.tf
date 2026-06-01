@@ -63,11 +63,26 @@ resource "helm_release" "kube_prometheus_stack" {
     })
   ]
 
+  # KEEP THESE — they fix the actual current problem (missing admission cert secret)
+  set {
+    name  = "prometheusOperator.admissionWebhooks.enabled"
+    value = "false"
+  }
+  set {
+    name  = "prometheusOperator.admissionWebhooks.patch.enabled"
+    value = "false"
+  }
+  set {
+    name  = "prometheusOperator.tls.enabled"
+    value = "false"
+  }
+
+
   timeout          = 900
   wait             = true
-  disable_webhooks = true
+  atomic           = true
+  cleanup_on_fail  = true
   create_namespace = false
-
   depends_on = [
     kubernetes_namespace_v1.monitoring,
   ]
