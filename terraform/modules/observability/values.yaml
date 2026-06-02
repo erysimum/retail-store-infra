@@ -107,7 +107,6 @@ alertmanager:
         - matchers:
             - severity = "warning"
           receiver: 'slack-warnings'
-       
 
     # Inhibition: if a critical alert is firing, suppress
     # related warning alerts to avoid duplicate noise
@@ -119,6 +118,17 @@ alertmanager:
         equal: ['alertname', 'service']
 
     # Alert receivers (the destinations)
+    #
+    # Template design notes:
+    # - Every "Alert" line uses a fallback chain:
+    #     summary annotation → description annotation → synthesized from labels
+    #   so Pyrra-generated alerts (which lack summary/description by default)
+    #   still produce useful messages instead of empty fields.
+    # - Conditional rendering ({{ if .Labels.X }}) hides lines for labels
+    #   that don't exist on a given alert (e.g., ServiceDown lacks slo/long).
+    # - PagerDuty uses .CommonAnnotations / .CommonLabels because one incident
+    #   represents the whole group; Slack uses .Annotations / .Labels inside
+    #   a range loop because each alert in the group can render its own line.
     receivers:
       # Black hole for Watchdog
       - name: 'null'
@@ -131,10 +141,12 @@ alertmanager:
             title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
             text: |
               {{ range .Alerts }}
-              *Alert:* {{ .Annotations.summary }}{{ if .Labels.severity }} - `{{ .Labels.severity }}`{{ end }}
-              *Description:* {{ .Annotations.description }}
-              *Service:* {{ .Labels.service }}
-              *Runbook:* {{ .Annotations.runbook_url }}
+              *Alert:* {{ if .Annotations.summary }}{{ .Annotations.summary }}{{ else if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Labels.alertname }} fired{{ if .Labels.service }} on service `{{ .Labels.service }}`{{ end }}{{ end }}
+              *Severity:* `{{ .Labels.severity }}`
+              {{ if .Labels.service }}*Service:* `{{ .Labels.service }}`{{ end }}
+              {{ if .Labels.slo }}*SLO:* `{{ .Labels.slo }}`{{ end }}
+              {{ if .Labels.long }}*Burn window:* `{{ .Labels.long }}` (short: `{{ .Labels.short }}`){{ end }}
+              {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
               {{ end }}
 
       # Critical alerts to Slack (also goes to PagerDuty in parallel)
@@ -147,10 +159,12 @@ alertmanager:
             text: |
               {{ range .Alerts }}
               *PAGING ON-CALL ENGINEER*
-              *Alert:* {{ .Annotations.summary }}
-              *Description:* {{ .Annotations.description }}
-              *Service:* {{ .Labels.service }}
-              *Runbook:* {{ .Annotations.runbook_url }}
+              *Alert:* {{ if .Annotations.summary }}{{ .Annotations.summary }}{{ else if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Labels.alertname }} fired{{ if .Labels.service }} on service `{{ .Labels.service }}`{{ end }}{{ end }}
+              {{ if .Labels.service }}*Service:* `{{ .Labels.service }}`{{ end }}
+              {{ if .Labels.slo }}*SLO:* `{{ .Labels.slo }}`{{ end }}
+              {{ if .Labels.long }}*Burn window:* `{{ .Labels.long }}` (short: `{{ .Labels.short }}`){{ end }}
+              {{ if .Labels.exhaustion }}*Budget exhausted in:* `{{ .Labels.exhaustion }}`{{ end }}
+              {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
               {{ end }}
 
       # Warning alerts to Slack
@@ -162,21 +176,26 @@ alertmanager:
             title: '⚠️ [WARNING] {{ .GroupLabels.alertname }}'
             text: |
               {{ range .Alerts }}
-              *Alert:* {{ .Annotations.summary }}
-              *Description:* {{ .Annotations.description }}
-              *Service:* {{ .Labels.service }}
-              *Runbook:* {{ .Annotations.runbook_url }}
+              *Alert:* {{ if .Annotations.summary }}{{ .Annotations.summary }}{{ else if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Labels.alertname }} fired{{ if .Labels.service }} on service `{{ .Labels.service }}`{{ end }}{{ end }}
+              {{ if .Labels.service }}*Service:* `{{ .Labels.service }}`{{ end }}
+              {{ if .Labels.slo }}*SLO:* `{{ .Labels.slo }}`{{ end }}
+              {{ if .Labels.long }}*Burn window:* `{{ .Labels.long }}` (short: `{{ .Labels.short }}`){{ end }}
+              {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
               {{ end }}
 
-      # PagerDuty for critical alerts (phone call)
+      # PagerDuty for critical alerts
       - name: 'pagerduty'
         pagerduty_configs:
           - routing_key: "${pagerduty_integration_key}"
-            description: '{{ .CommonAnnotations.summary }}'
+            description: '{{ if .CommonAnnotations.summary }}{{ .CommonAnnotations.summary }}{{ else if .CommonAnnotations.description }}{{ .CommonAnnotations.description }}{{ else }}{{ .CommonLabels.alertname }} fired{{ if .CommonLabels.service }} on service {{ .CommonLabels.service }}{{ end }}{{ end }}'
             details:
               alertname: '{{ .CommonLabels.alertname }}'
               service: '{{ .CommonLabels.service }}'
               severity: '{{ .CommonLabels.severity }}'
+              slo: '{{ .CommonLabels.slo }}'
+              burn_window_long: '{{ .CommonLabels.long }}'
+              burn_window_short: '{{ .CommonLabels.short }}'
+              exhaustion: '{{ .CommonLabels.exhaustion }}'
               description: '{{ .CommonAnnotations.description }}'
               runbook: '{{ .CommonAnnotations.runbook_url }}'
 
