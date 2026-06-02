@@ -1,444 +1,341 @@
-#!/usr/bin/env bash
-# destroy.sh - Tear down retail-store EKS cluster cleanly
-# v4: Proactive Helm cleanup + namespace finalizer clearing + state cleanup
-#     before terraform destroy. Encodes lessons from real destroy failures
-#     where helm uninstall on kube-prometheus-stack hung for 10+ min.
+#!/bin/bash
+# ============================================================================
+# destroy.sh — Clean teardown of the retail-store EKS cluster
+# Version: 5 (encodes lessons from session 2026-05-27)
 #
-# Place this in: ~/projects/retail-store/retail-store-infra/destroy.sh
-# Usage:         ./destroy.sh
+# Handles:
+# - Failed Helm releases (helm uninstalls before terraform destroy attempts)
+# - Manually-applied AWS resources (the SG rule for Istio webhook port 15017)
+# - Orphaned NLBs, target groups, security groups, ENIs blocking VPC deletion
+# - Stuck namespaces with finalizers
+# - Pyrra CRDs that block namespace deletion
+# - Terraform state with broken Helm provider references
+# - Cluster takes a few minutes to finish background cleanup after terraform exits
 #
-# Environment overrides (optional):
-#   CLUSTER_NAME (default: retail-store-dev)
-#   AWS_REGION   (default: ap-southeast-2)
-#   TF_DIR       (default: terraform/environments/dev)
+# Usage:
+#   cd ~/projects/retail-store/retail-store-infra/terraform/environments/dev
+#   bash ../../../destroy.sh
+#
+# Costs preserved (intentional):
+# - AWS Secrets Manager secrets ($1.60/month total for 4 secrets)
+# - S3 bucket and DynamoDB table for terraform state (~pennies)
+# - ECR repositories (force_delete is true, images wiped on destroy)
+# ============================================================================
 
-set -uo pipefail   # NOT -e — we want cleanup to continue past individual failures
+set -u  # exit on undefined variable (but NOT on errors — we tolerate many)
 
-# =====================================================================
-# Disable AWS CLI v2 pager (this is what makes you press 'q' on every
-# `aws ec2 describe-*` call). Setting AWS_PAGER="" turns it off globally
-# for this shell. PAGER="" catches anything else that might paginate.
-# =====================================================================
-export AWS_PAGER=""
-export PAGER=""
-
-# =====================================================================
-# Configuration
-# =====================================================================
+# ────────────────────────────────────────────────────────────────────────────
+# CONFIG — adjust these if your setup differs
+# ────────────────────────────────────────────────────────────────────────────
+REGION="${REGION:-ap-southeast-2}"
 CLUSTER_NAME="${CLUSTER_NAME:-retail-store-dev}"
-AWS_REGION="${AWS_REGION:-ap-southeast-2}"
-TF_DIR="${TF_DIR:-terraform/environments/dev}"
+TERRAFORM_DIR="${TERRAFORM_DIR:-$HOME/projects/retail-store/retail-store-infra/terraform/environments/dev}"
 
-# Helm releases that are heavy/fragile during uninstall.
-# These get force-uninstalled BEFORE terraform destroy to avoid timeouts.
-HEAVY_RELEASES=(
-  "kube-prometheus-stack:monitoring"
-  "pyrra:monitoring"
-  "argocd:argocd"
-  "argocd-image-updater:argocd"
-  "nginx-external:ingress-nginx"
-  "aws-load-balancer-controller:kube-system"
-  "metrics-server:kube-system"
-)
-
-# Namespaces that often get stuck terminating due to CRD finalizers.
-STUCK_NAMESPACES=("monitoring" "argocd" "ingress-nginx")
-
-# Colors for readable output
+# Colors for readability
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-BOLD='\033[1m'
 NC='\033[0m'
 
-log()  { echo -e "${BLUE}[$(date +%H:%M:%S)]${NC} ${BOLD}$1${NC}"; }
-ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
-warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
-err()  { echo -e "  ${RED}✗${NC} $1"; }
+log()    { echo -e "${BLUE}[$(date +%H:%M:%S)]${NC} $*"; }
+warn()   { echo -e "${YELLOW}[$(date +%H:%M:%S)] WARN:${NC} $*"; }
+err()    { echo -e "${RED}[$(date +%H:%M:%S)] ERR:${NC}  $*"; }
+ok()     { echo -e "${GREEN}[$(date +%H:%M:%S)] OK:${NC}   $*"; }
+step()   { echo ""; echo -e "${BLUE}========================================${NC}"; echo -e "${BLUE}  $*${NC}"; echo -e "${BLUE}========================================${NC}"; }
 
-log "=========================================="
-log "  RETAIL-STORE EKS DESTROY (v4)"
-log "  Cluster: ${CLUSTER_NAME}"
-log "  Region:  ${AWS_REGION}"
-log "  TF dir:  ${TF_DIR}"
-log "=========================================="
+# ────────────────────────────────────────────────────────────────────────────
+# Confirmation
+# ────────────────────────────────────────────────────────────────────────────
+step "Destroy confirmation"
+echo "This will TEAR DOWN cluster '$CLUSTER_NAME' in region '$REGION'."
+echo "It will destroy:"
+echo "  - EKS cluster + node group"
+echo "  - VPC + subnets + NAT gateway + EIPs"
+echo "  - All Helm releases (ArgoCD, kube-prometheus-stack, Istio, etc.)"
+echo "  - ECR images (force_delete=true on the repos)"
+echo "  - Manually-applied AWS resources (SG rules for Istio webhook)"
 echo ""
-
-# =====================================================================
-# STEP 1 — Capture VPC ID from Terraform state
-# =====================================================================
-log "Step 1: Capturing VPC ID from Terraform state..."
-
-if [ ! -d "${TF_DIR}" ]; then
-  err "Terraform directory not found: ${TF_DIR}"
-  err "Run this script from the repo root, or set TF_DIR=<path>"
-  exit 1
+echo "It will PRESERVE:"
+echo "  - AWS Secrets Manager secrets (\$1.60/month)"
+echo "  - S3/DynamoDB Terraform backend state"
+echo ""
+read -p "Type 'destroy' to proceed: " confirm
+if [ "$confirm" != "destroy" ]; then
+  echo "Aborted."
+  exit 0
 fi
 
-cd "${TF_DIR}"
-VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "")
-cd - > /dev/null
+cd "$TERRAFORM_DIR" || { err "Cannot cd to $TERRAFORM_DIR"; exit 1; }
+ok "Starting destroy at $(date)"
 
-if [ -z "${VPC_ID}" ]; then
-  warn "No VPC ID in Terraform state - already destroyed or apply never ran"
+# ────────────────────────────────────────────────────────────────────────────
+# Step 1: Verify kubectl context
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 1: Verify kubectl context"
+if kubectl cluster-info >/dev/null 2>&1; then
+  CURRENT_CTX=$(kubectl config current-context 2>/dev/null || echo "unknown")
+  ok "kubectl context: $CURRENT_CTX"
 else
-  ok "VPC ID captured: ${VPC_ID}"
+  warn "kubectl not reachable — cluster may already be partially gone. Continuing."
 fi
-echo ""
 
-# =====================================================================
-# STEP 2 — Pre-clean Kubernetes resources (SLOs + PVCs)
-# =====================================================================
-log "Step 2: Pre-cleaning Kubernetes resources..."
+# ────────────────────────────────────────────────────────────────────────────
+# Step 2: Pre-clean Kubernetes resources that block VPC/SG deletion
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 2: Pre-clean Kubernetes resources"
 
-if kubectl cluster-info &>/dev/null; then
+# Delete LoadBalancer services first — these create AWS NLBs that block VPC delete
+log "Deleting LoadBalancer-type Services..."
+kubectl get svc -A -o json 2>/dev/null | \
+  jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace) \(.metadata.name)"' | \
+  while read ns name; do
+    log "  Deleting service $name in $ns"
+    kubectl delete svc "$name" -n "$ns" --timeout=60s --wait=false 2>/dev/null || true
+  done
 
-  log "  → Deleting Pyrra SLO custom resources..."
-  if kubectl delete slo --all -A --timeout=60s &>/dev/null; then
-    ok "SLOs deleted"
-  else
-    warn "No SLOs to delete (or already gone)"
-  fi
+# Delete any Istio VirtualServices (chaos faults) before istio removal
+log "Deleting any chaos VirtualServices..."
+kubectl delete virtualservice --all -A --timeout=60s 2>/dev/null || true
 
-  log "  → Deleting all PVCs (releases EBS volumes via CSI driver)..."
-  PVC_NAMESPACES=$(kubectl get pvc -A --no-headers 2>/dev/null | awk '{print $1}' | sort -u)
-  if [ -n "${PVC_NAMESPACES}" ]; then
-    for ns in ${PVC_NAMESPACES}; do
-      log "    Namespace: ${ns}"
-      kubectl delete pvc --all -n "$ns" --timeout=60s 2>/dev/null || true
+# Delete Pyrra SLOs before destroying observability namespace
+log "Deleting Pyrra SLOs..."
+kubectl delete servicelevelobjective --all -A --timeout=60s 2>/dev/null || true
+
+# Wait for LoadBalancer cleanup to begin
+sleep 15
+ok "Pre-clean done"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Step 3: Uninstall failed Helm releases
+# AWS Helm provider's bug: a release in `failed` state triggers
+# destroy-then-reinstall on next terraform apply. Clean these first so
+# terraform destroy gets a clean exit.
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 3: Clean up failed Helm releases"
+if command -v helm >/dev/null 2>&1; then
+  FAILED_RELEASES=$(helm list -A 2>/dev/null | awk '$8=="failed"||$9=="failed" {print $1" "$2}')
+  if [ -n "$FAILED_RELEASES" ]; then
+    warn "Found failed Helm releases — uninstalling:"
+    echo "$FAILED_RELEASES" | while read name ns; do
+      log "  helm uninstall $name -n $ns"
+      helm uninstall "$name" -n "$ns" 2>/dev/null || true
     done
-    log "  → Waiting 30s for EBS CSI driver to delete volumes in AWS..."
-    sleep 30
-    ok "PVCs released"
   else
-    ok "No PVCs found"
+    ok "No failed Helm releases found"
   fi
-
 else
-  warn "kubectl can't reach cluster - skipping K8s pre-clean"
+  warn "helm CLI not available — skipping"
 fi
-echo ""
 
-# =====================================================================
-# STEP 2.5 — NEW IN V4: Proactive Helm release force-uninstall
-#
-# Why this exists:
-#   terraform destroy calls `helm uninstall` for each helm_release.
-#   For heavy charts (kube-prometheus-stack with ~30 CRDs, argocd, etc.)
-#   that uninstall can take 10+ minutes due to CRD finalizers and
-#   pre-delete hooks racing with admission webhook deletion. When it
-#   exceeds the helm provider timeout, terraform destroy errors out and
-#   never proceeds to destroy EKS, leaving the cluster alive.
-#
-# What this step does:
-#   Force-uninstalls each heavy release with --no-hooks and a short
-#   timeout. Skips finalizer waits and webhook races. Then clears
-#   stuck namespace finalizers via the /finalize subresource.
-# =====================================================================
-log "Step 2.5: Proactive Helm release force-uninstall..."
+# ────────────────────────────────────────────────────────────────────────────
+# Step 4: Delete CRDs that block namespace deletion
+# Pyrra CRDs, Istio CRDs, ArgoCD CRDs all have finalizers
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 4: Clear finalizers on namespaces"
 
-if kubectl cluster-info &>/dev/null; then
+for ns in monitoring argocd istio-system ingress-nginx \
+          ui-dev catalog-dev cart-dev checkout-dev orders-dev loadtest; do
+  if kubectl get ns "$ns" >/dev/null 2>&1; then
+    log "  Removing finalizers from $ns"
+    kubectl patch namespace "$ns" -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+  fi
+done
 
-  for entry in "${HEAVY_RELEASES[@]}"; do
-    name="${entry%%:*}"
-    ns="${entry##*:}"
+ok "Namespace finalizers cleared"
 
-    if helm status "$name" -n "$ns" &>/dev/null; then
-      log "  → Force-uninstalling $name in namespace $ns..."
-      if helm uninstall "$name" -n "$ns" --no-hooks --timeout 60s 2>/dev/null; then
-        ok "Uninstalled $name"
-      else
-        warn "$name uninstall failed or timed out — terraform will retry"
-      fi
-    fi
-  done
+# ────────────────────────────────────────────────────────────────────────────
+# Step 5: Get VPC ID for orphan cleanup (before terraform destroys it)
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 5: Identify VPC for orphan cleanup"
+VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || \
+         aws ec2 describe-vpcs \
+           --filters "Name=tag:Name,Values=*${CLUSTER_NAME}*" \
+           --region "$REGION" \
+           --query 'Vpcs[0].VpcId' \
+           --output text 2>/dev/null || echo "")
 
-  log "  → Clearing finalizers on stuck namespaces..."
-  for ns in "${STUCK_NAMESPACES[@]}"; do
-    if kubectl get namespace "$ns" &>/dev/null; then
-      kubectl get namespace "$ns" -o json 2>/dev/null | \
-        jq '.spec.finalizers = [] | .metadata.finalizers = []' | \
-        kubectl replace --raw "/api/v1/namespaces/${ns}/finalize" -f - &>/dev/null && \
-        ok "Finalizers cleared on namespace $ns" || \
-        warn "Could not clear finalizers on $ns (may not need it)"
-    fi
-  done
-
+if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ] && [ "$VPC_ID" != "null" ]; then
+  ok "VPC ID: $VPC_ID"
 else
-  warn "kubectl can't reach cluster - skipping Helm/finalizer cleanup"
+  warn "Could not determine VPC ID — orphan cleanup will be limited"
+  VPC_ID=""
 fi
-echo ""
 
-# =====================================================================
-# STEP 3 — Pre-clean orphaned AWS resources (only if VPC_ID known)
-# =====================================================================
-if [ -n "${VPC_ID}" ]; then
-  log "Step 3: Pre-cleaning orphaned AWS resources in ${VPC_ID}..."
+# ────────────────────────────────────────────────────────────────────────────
+# Step 6: Delete orphaned NLBs in our VPC
+# ────────────────────────────────────────────────────────────────────────────
+if [ -n "$VPC_ID" ]; then
+  step "Step 6: Delete orphaned load balancers"
 
-  log "  → Looking for orphaned NLBs..."
   NLB_ARNS=$(aws elbv2 describe-load-balancers \
-    --region "${AWS_REGION}" \
-    --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" \
+    --region "$REGION" \
+    --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
     --output text 2>/dev/null || echo "")
 
-  if [ -n "${NLB_ARNS}" ]; then
-    for arn in ${NLB_ARNS}; do
-      log "    Deleting NLB: ${arn##*/}"
-      aws elbv2 delete-load-balancer \
-        --region "${AWS_REGION}" \
-        --load-balancer-arn "$arn" 2>/dev/null \
-        && ok "NLB deleted" \
-        || warn "NLB delete failed (continuing)"
+  if [ -n "$NLB_ARNS" ]; then
+    for arn in $NLB_ARNS; do
+      log "  Deleting NLB: $arn"
+      aws elbv2 delete-load-balancer --load-balancer-arn "$arn" --region "$REGION" 2>/dev/null || true
     done
-    log "  → Waiting 60s for NLB deletion to propagate (releases ENIs)..."
-    sleep 60
+    log "  Waiting 30s for NLB tear-down..."
+    sleep 30
   else
     ok "No orphaned NLBs"
   fi
 
-  log "  → Looking for orphaned target groups..."
+  # Target groups (orphaned by NLB deletion)
   TG_ARNS=$(aws elbv2 describe-target-groups \
-    --region "${AWS_REGION}" \
-    --query "TargetGroups[?VpcId=='${VPC_ID}'].TargetGroupArn" \
+    --region "$REGION" \
+    --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
     --output text 2>/dev/null || echo "")
 
-  if [ -n "${TG_ARNS}" ]; then
-    for arn in ${TG_ARNS}; do
-      aws elbv2 delete-target-group \
-        --region "${AWS_REGION}" \
-        --target-group-arn "$arn" 2>/dev/null \
-        && ok "Target group deleted: ${arn##*/}" \
-        || warn "TG delete failed"
+  if [ -n "$TG_ARNS" ]; then
+    for arn in $TG_ARNS; do
+      log "  Deleting Target Group: $arn"
+      aws elbv2 delete-target-group --target-group-arn "$arn" --region "$REGION" 2>/dev/null || true
     done
-  else
-    ok "No orphaned target groups"
   fi
+fi
 
-  log "  → Looking for orphaned network interfaces..."
+# ────────────────────────────────────────────────────────────────────────────
+# Step 7: Remove manually-added security group rules
+# Session 2026-05-27 added inbound rule for istiod webhook (port 15017)
+# Terraform doesn't know about these → won't delete them → blocks SG delete
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 7: Remove manually-added SG rules"
+
+if [ -n "$VPC_ID" ]; then
+  NODE_SGS=$(aws ec2 describe-security-groups \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*node*" \
+    --region "$REGION" \
+    --query 'SecurityGroups[*].GroupId' \
+    --output text 2>/dev/null || echo "")
+
+  for sg in $NODE_SGS; do
+    log "  Inspecting SG: $sg"
+    RULES=$(aws ec2 describe-security-group-rules \
+      --filters "Name=group-id,Values=$sg" \
+      --region "$REGION" \
+      --query "SecurityGroupRules[?IsEgress==\`false\` && FromPort==\`15017\`].SecurityGroupRuleId" \
+      --output text 2>/dev/null || echo "")
+
+    for rule in $RULES; do
+      log "    Revoking rule $rule (port 15017 ingress)"
+      aws ec2 revoke-security-group-ingress \
+        --group-id "$sg" \
+        --security-group-rule-ids "$rule" \
+        --region "$REGION" 2>/dev/null || true
+    done
+  done
+  ok "Manual SG rules cleaned"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# Step 8: Disable ArgoCD selfHeal (so it doesn't fight us during destroy)
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 8: Disable ArgoCD selfHeal"
+kubectl get application -n argocd -o name 2>/dev/null | \
+  while read app; do
+    kubectl patch "$app" -n argocd \
+      --type=merge \
+      -p '{"spec":{"syncPolicy":{"automated":{"selfHeal":false,"prune":false}}}}' 2>/dev/null || true
+  done
+ok "ArgoCD selfHeal disabled"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Step 9: Run terraform destroy
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 9: Run terraform destroy"
+log "This takes 10-15 minutes. Walk away."
+terraform destroy -auto-approve
+
+TF_EXIT=$?
+if [ $TF_EXIT -eq 0 ]; then
+  ok "terraform destroy completed cleanly"
+else
+  err "terraform destroy exited with code $TF_EXIT — running cleanup retry"
+  log "Retry with refresh first to update state..."
+  terraform destroy -auto-approve -refresh=true
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# Step 10: Final orphan sweep
+# Sometimes ENIs and SGs linger after destroy
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 10: Final orphan sweep"
+
+if [ -n "$VPC_ID" ]; then
+  # Orphaned ENIs
   ENI_IDS=$(aws ec2 describe-network-interfaces \
-    --region "${AWS_REGION}" \
-    --filters "Name=vpc-id,Values=${VPC_ID}" "Name=status,Values=available" \
-    --query 'NetworkInterfaces[].NetworkInterfaceId' \
+    --filters "Name=vpc-id,Values=$VPC_ID" \
+    --region "$REGION" \
+    --query 'NetworkInterfaces[?Status==`available`].NetworkInterfaceId' \
     --output text 2>/dev/null || echo "")
 
-  if [ -n "${ENI_IDS}" ]; then
-    for eni in ${ENI_IDS}; do
-      aws ec2 delete-network-interface \
-        --region "${AWS_REGION}" \
-        --network-interface-id "$eni" 2>/dev/null \
-        && ok "ENI ${eni} deleted" \
-        || warn "ENI ${eni} delete failed"
-    done
-  else
-    ok "No orphaned ENIs"
-  fi
+  for eni in $ENI_IDS; do
+    log "  Deleting orphaned ENI: $eni"
+    aws ec2 delete-network-interface --network-interface-id "$eni" --region "$REGION" 2>/dev/null || true
+  done
 
-  log "  → Looking for orphaned security groups..."
-  SG_IDS=$(aws ec2 describe-security-groups \
-    --region "${AWS_REGION}" \
-    --filters "Name=vpc-id,Values=${VPC_ID}" \
-    --query "SecurityGroups[?GroupName!='default'].GroupId" \
+  # Orphaned SGs (non-default)
+  ORPHAN_SGS=$(aws ec2 describe-security-groups \
+    --filters "Name=vpc-id,Values=$VPC_ID" \
+    --region "$REGION" \
+    --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
     --output text 2>/dev/null || echo "")
 
-  if [ -n "${SG_IDS}" ]; then
-    log "    Pass 1: Revoking all SG rules (breaks circular refs)..."
-    for sg in ${SG_IDS}; do
-      INGRESS=$(aws ec2 describe-security-groups \
-        --region "${AWS_REGION}" --group-ids "$sg" \
-        --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null)
-      if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ]; then
-        aws ec2 revoke-security-group-ingress \
-          --region "${AWS_REGION}" --group-id "$sg" \
-          --ip-permissions "$INGRESS" 2>/dev/null || true
-      fi
-
-      EGRESS=$(aws ec2 describe-security-groups \
-        --region "${AWS_REGION}" --group-ids "$sg" \
-        --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null)
-      if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ]; then
-        aws ec2 revoke-security-group-egress \
-          --region "${AWS_REGION}" --group-id "$sg" \
-          --ip-permissions "$EGRESS" 2>/dev/null || true
-      fi
-    done
-
-    log "    Pass 2: Deleting security groups..."
-    for sg in ${SG_IDS}; do
-      aws ec2 delete-security-group \
-        --region "${AWS_REGION}" --group-id "$sg" 2>/dev/null \
-        && ok "SG ${sg} deleted" \
-        || warn "SG ${sg} - terraform destroy may handle it"
-    done
-  else
-    ok "No non-default security groups"
-  fi
-
-else
-  log "Step 3: Skipped (no VPC ID)"
-fi
-echo ""
-
-# =====================================================================
-# STEP 3.5 — NEW IN V4: Remove already-uninstalled Helm releases
-#              and stuck Kubernetes resources from Terraform state
-#
-# Why this exists:
-#   After Step 2.5 force-uninstalled the Helm releases, Terraform may
-#   still try to manage them and hang trying to confirm deletion. Same
-#   for Kubernetes namespaces stuck on finalizers.
-# =====================================================================
-log "Step 3.5: Removing already-cleaned resources from Terraform state..."
-
-cd "${TF_DIR}"
-
-HELM_RESOURCES=$(terraform state list 2>/dev/null | grep "helm_release" || echo "")
-if [ -n "${HELM_RESOURCES}" ]; then
-  while IFS= read -r resource; do
-    log "  → terraform state rm $resource"
-    terraform state rm "$resource" &>/dev/null \
-      && ok "Removed from state" \
-      || warn "Could not remove (may already be gone)"
-  done <<< "${HELM_RESOURCES}"
-else
-  ok "No helm_release resources in Terraform state"
-fi
-
-K8S_NS_RESOURCES=$(terraform state list 2>/dev/null | grep "kubernetes_namespace" || echo "")
-if [ -n "${K8S_NS_RESOURCES}" ]; then
-  while IFS= read -r resource; do
-    log "  → terraform state rm $resource"
-    terraform state rm "$resource" &>/dev/null \
-      && ok "Removed namespace from state" \
-      || warn "Could not remove namespace from state"
-  done <<< "${K8S_NS_RESOURCES}"
-fi
-
-cd - > /dev/null
-echo ""
-
-# =====================================================================
-# STEP 4 — terraform destroy (auto-approved, no pager)
-# =====================================================================
-log "Step 4: Running terraform destroy (auto-approved)..."
-log "  Expected duration: 8-12 minutes (faster after pre-cleanup)."
-echo ""
-
-cd "${TF_DIR}"
-
-terraform destroy -auto-approve 2>&1 | tee /tmp/terraform-destroy.log
-DESTROY_EXIT=${PIPESTATUS[0]}
-
-cd - > /dev/null
-
-if [ "${DESTROY_EXIT}" -eq 0 ]; then
-  ok "terraform destroy succeeded"
-else
-  warn "terraform destroy exited with ${DESTROY_EXIT}"
-  warn "Continuing with post-destroy verification..."
-fi
-echo ""
-
-# =====================================================================
-# STEP 5 — Post-destroy: clean orphaned EBS volumes
-# =====================================================================
-log "Step 5: Cleaning orphaned EBS volumes..."
-
-ORPHAN_VOLS_NEW=$(aws ec2 describe-volumes \
-  --region "${AWS_REGION}" \
-  --filters \
-    "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
-    "Name=status,Values=available" \
-  --query 'Volumes[].VolumeId' \
-  --output text 2>/dev/null || echo "")
-
-ORPHAN_VOLS_LEGACY=$(aws ec2 describe-volumes \
-  --region "${AWS_REGION}" \
-  --filters \
-    "Name=tag:KubernetesCluster,Values=${CLUSTER_NAME}" \
-    "Name=status,Values=available" \
-  --query 'Volumes[].VolumeId' \
-  --output text 2>/dev/null || echo "")
-
-ORPHAN_VOLS_CSI=$(aws ec2 describe-volumes \
-  --region "${AWS_REGION}" \
-  --filters \
-    "Name=tag-key,Values=CSIVolumeName" \
-    "Name=status,Values=available" \
-  --query 'Volumes[].VolumeId' \
-  --output text 2>/dev/null || echo "")
-
-ALL_ORPHANS=$(echo "${ORPHAN_VOLS_NEW} ${ORPHAN_VOLS_LEGACY} ${ORPHAN_VOLS_CSI}" \
-  | tr ' ' '\n' | grep -v '^$' | sort -u)
-
-if [ -z "${ALL_ORPHANS}" ]; then
-  ok "No orphaned EBS volumes found"
-else
-  ORPHAN_COUNT=$(echo "${ALL_ORPHANS}" | wc -l)
-  warn "Found ${ORPHAN_COUNT} orphaned EBS volume(s)"
-  for vol in ${ALL_ORPHANS}; do
-    log "  → Deleting orphaned volume: ${vol}"
-    aws ec2 delete-volume \
-      --region "${AWS_REGION}" \
-      --volume-id "$vol" 2>/dev/null \
-      && ok "Deleted ${vol}" \
-      || err "Failed to delete ${vol} (may need manual cleanup)"
+  for sg in $ORPHAN_SGS; do
+    log "  Deleting orphaned SG: $sg"
+    aws ec2 delete-security-group --group-id "$sg" --region "$REGION" 2>/dev/null || true
   done
 fi
-echo ""
 
-# =====================================================================
-# STEP 6 — Final verification
-# =====================================================================
-log "Step 6: Verifying clean state..."
+# ────────────────────────────────────────────────────────────────────────────
+# Step 11: Verify nothing remains
+# ────────────────────────────────────────────────────────────────────────────
+step "Step 11: Verification"
 
-CLUSTERS=$(aws eks list-clusters --region "${AWS_REGION}" \
-  --query 'clusters' --output text 2>/dev/null || echo "")
-if echo "${CLUSTERS}" | grep -q "${CLUSTER_NAME}" 2>/dev/null; then
-  err "EKS cluster ${CLUSTER_NAME} still exists!"
+CLUSTERS=$(aws eks list-clusters --region "$REGION" --query "clusters[?contains(@, '$CLUSTER_NAME')]" --output text 2>/dev/null || echo "")
+if [ -n "$CLUSTERS" ]; then
+  warn "EKS cluster still exists: $CLUSTERS (may be deleting in background)"
 else
-  ok "No EKS clusters remaining"
+  ok "No EKS clusters remain"
 fi
 
-LB_COUNT=$(aws elbv2 describe-load-balancers --region "${AWS_REGION}" \
-  --query 'length(LoadBalancers)' --output text 2>/dev/null || echo "0")
-ok "Load balancers in region: ${LB_COUNT}"
-
-NAT_COUNT=$(aws ec2 describe-nat-gateways --region "${AWS_REGION}" \
-  --filter "Name=state,Values=available" \
-  --query 'length(NatGateways)' --output text 2>/dev/null || echo "0")
-ok "Active NAT gateways: ${NAT_COUNT}"
-
-EIP_COUNT=$(aws ec2 describe-addresses --region "${AWS_REGION}" \
-  --query 'length(Addresses)' --output text 2>/dev/null || echo "0")
-if [ "${EIP_COUNT}" != "0" ]; then
-  warn "Elastic IPs: ${EIP_COUNT} (these incur charges if unattached!)"
+NAT_COUNT=$(aws ec2 describe-nat-gateways \
+  --filter "Name=state,Values=available,pending" \
+  --region "$REGION" \
+  --query 'length(NatGateways[])' \
+  --output text 2>/dev/null || echo "0")
+if [ "$NAT_COUNT" != "0" ]; then
+  warn "$NAT_COUNT NAT gateway(s) still active (\$0.045/hr each)"
 else
-  ok "Elastic IPs: 0"
+  ok "No active NAT gateways"
 fi
 
-REMAINING_VOLS=$(aws ec2 describe-volumes \
-  --region "${AWS_REGION}" \
-  --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" \
-  --query 'length(Volumes)' --output text 2>/dev/null || echo "0")
-if [ "${REMAINING_VOLS}" != "0" ]; then
-  warn "EBS volumes still tagged for cluster: ${REMAINING_VOLS}"
+EIP_COUNT=$(aws ec2 describe-addresses --region "$REGION" --query 'length(Addresses[])' --output text 2>/dev/null || echo "0")
+if [ "$EIP_COUNT" != "0" ]; then
+  warn "$EIP_COUNT Elastic IP(s) still allocated (\$0.005/hr each unassociated)"
 else
-  ok "EBS volumes tagged for cluster: 0"
+  ok "No Elastic IPs"
 fi
 
+LB_COUNT=$(aws elbv2 describe-load-balancers --region "$REGION" --query 'length(LoadBalancers[])' --output text 2>/dev/null || echo "0")
+if [ "$LB_COUNT" != "0" ]; then
+  warn "$LB_COUNT load balancer(s) still exist"
+else
+  ok "No load balancers"
+fi
+
+step "Destroy complete"
 echo ""
-log "=========================================="
-log "  DESTROY COMPLETE"
-log "=========================================="
+echo "Remaining costs (intentional):"
+echo "  - 4 Secrets Manager secrets: ~\$1.60/month"
+echo "  - S3 + DynamoDB for terraform state: ~pennies/month"
 echo ""
-log "Persistent resources (NOT destroyed by this script):"
-log "  - AWS Secrets Manager secrets (~\$1.60/month for 4 secrets):"
-log "      retail-store/github-pat"
-log "      retail-store/grafana-admin"
-log "      retail-store/slack-webhook"
-log "      retail-store/pagerduty-key"
-log "  - Terraform state bucket (S3) + lock table (DynamoDB)"
-log ""
-log "If you see warnings above (NLBs, ENIs, SGs), re-run this script."
-log "Most stragglers clear on a second pass."
+echo "If warnings appeared above, give AWS ~5 minutes to finish background"
+echo "deletes, then re-run this script — it's idempotent."
+echo ""
+ok "Done at $(date)"
+
