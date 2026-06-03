@@ -13,6 +13,25 @@ defaultRules:
     kubeProxy: false
     etcd: false
 
+# EKS-managed components — also disable the ServiceMonitors themselves so
+# Prometheus doesn't waste cycles scraping targets it can never reach.
+# Without this, Prometheus retries failed scrapes every 30s, filling logs
+# with "context deadline exceeded" errors and showing up{}=0 for these
+# components forever.
+#
+# Two independent switches per component:
+#   defaultRules.rules.kubeXXX (above) = no alert rule generated
+#   kubeXXX.enabled (here)              = no ServiceMonitor generated
+# We disable both — defense in depth.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
 # -----------------------------------------------
 # Prometheus
 # -----------------------------------------------
