@@ -1,8 +1,10 @@
 # Retail Store Platform — Infrastructure
 
-This Terraform project builds the complete AWS infrastructure for an EKS platform. It creates the VPC, Kubernetes cluster, core add-ons, GitOps setup, and observability tools that everything else runs on. A 5-service retail application runs on top of this platform, but this repository focuses on the foundation that supports it.
+This is the Terraform that builds the whole thing. It stands up the AWS side and the cluster: the VPC, the EKS cluster, the add-ons, ArgoCD for GitOps, and the observability stack. The retail app runs on top, but this repo is just the foundation it sits on.
 
-`terraform apply` brings up roughly 100 AWS resources in about 15 minutes with no manual steps after the first bootstrap.
+One `terraform apply` brings up around 100 AWS resources in about 15 minutes. After a one-time bootstrap, there are no manual steps.
+
+> 📸 **Want to see it actually running?** The [platform walkthrough](https://github.com/erysimum/retail-store-gitops/tree/main/docs/walkthrough) (over in the gitops repo) is the full tour with screenshots: traffic and SLOs, a load test, fault injection, and the AI agent diagnosing a live breach. Best place to get the whole story.
 
 What runs on the cluster:
 
@@ -15,9 +17,9 @@ To prove it works end to end I placed a real $10,205 order through the running s
 
 ---
 
-## The four repositories
+## The five repositories
 
-The project is split across four repos along team lines:
+I split the project across five repos, roughly the way different teams would own different pieces at a real company:
 
 | Repo | What it owns | Who'd own it |
 |------|-------------|--------------|
@@ -25,6 +27,7 @@ The project is split across four repos along team lines:
 | **[retail-store-platform](https://github.com/erysimum/retail-store-platform)** | Namespaces, RBAC, NetworkPolicy, ResourceQuota | Platform / Security |
 | **[retail-store-gitops](https://github.com/erysimum/retail-store-gitops)** | Helm charts, ArgoCD config, SLOs, dashboards | SRE / DevOps |
 | **[retail-store-app](https://github.com/erysimum/retail-store-app)** | App code, CI pipelines, Dockerfiles | App developers |
+| **[retail-store-ai](https://github.com/erysimum/retail-store-ai)** | The advisory AI SRE agent | SRE tooling |
 
 
 ---
@@ -236,7 +239,7 @@ In Pyrra the two SLOs moved in opposite directions. Catalog availability recover
 | Centralized logs (Loki + Promtail) |
 | Kiali for the Istio service graph |
 | Fix the Image Updater ECR auth |
-| Branch protection across all four repos |
+| Branch protection across all five repos |
 
 ---
 
